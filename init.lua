@@ -67,7 +67,10 @@ except Exception as e:
 "]]
 
   local output, status = hs.execute(cmd)
-  if not status or not output then return {} end
+  if not status or not output then
+    print("WARNING: python3 not found or plist read failed — Dock shortcuts unavailable")
+    return {}
+  end
 
   local ok, data = pcall(hs.json.decode, output)
   if not ok or not data then return {} end
@@ -341,9 +344,9 @@ local function showThumbnail(path, img)
 end
 
 local function processScreenshot(path)
+    if lastProcessed == path then return end
     local img = hs.image.imageFromPath(path)
     if not img then return end
-    if lastProcessed == path then return end
     lastProcessed = path
 
     -- Copy to clipboard: PNG (web file inputs) + TIFF (native apps) if available

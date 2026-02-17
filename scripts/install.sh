@@ -24,6 +24,7 @@ fi
 # 2. Ensure ~/.hammerspoon exists
 echo "[2/7] Ensuring ~/.hammerspoon directory..."
 mkdir -p "$HS_DIR"
+echo "  Ready."
 
 # 3. Symlink init.lua (skip backup if already pointing to repo)
 echo "[3/7] Symlinking init.lua..."
@@ -47,6 +48,7 @@ echo "  $HS_DIR/init.lua -> $REPO_DIR/init.lua"
 # 4. Ensure ~/Screenshots directory exists
 echo "[4/7] Ensuring ~/Screenshots directory..."
 mkdir -p "$HOME/Screenshots"
+echo "  Ready."
 
 # 5. Set macOS screenshot location to ~/Screenshots
 echo "[5/7] Configuring macOS screenshot settings..."
