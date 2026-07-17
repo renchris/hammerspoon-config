@@ -12,6 +12,8 @@ if thumbSlideTimer then thumbSlideTimer:stop() end
 if thumbFadeTimer then thumbFadeTimer:stop() end
 if dockRebindTimer then dockRebindTimer:stop() end
 if screenshotProcessTimer then screenshotProcessTimer:stop() end
+if screenshotTimers then for _, t in pairs(screenshotTimers) do if t then t:stop() end end end
+if caffeinateWatcher then caffeinateWatcher:stop() end
 if smartPasteTap then smartPasteTap:stop() end
 if appWatcher then appWatcher:stop() end
 if pathWatcher then pathWatcher:stop() end
@@ -220,7 +222,11 @@ thumbCanvas = nil          -- global: prevent GC of visible canvas
 thumbDismissTimer = nil    -- global: prevent GC of active timer
 thumbSlideTimer = nil      -- global: prevent GC of active timer
 thumbFadeTimer = nil       -- global: prevent GC of fade-out timer
-lastProcessed = nil        -- global: dedup across watcher callbacks
+lastProcessed = nil        -- global: dedup — set ONLY after a verified-complete copy
+screenshotTimers = {}      -- global: per-path settle timers (replaces the single debounce timer)
+
+-- Observability: `hs.logger` so future clipboard regressions are visible in the HS console.
+local slog = hs.logger.new("screenshot", "info")
 
 local THUMB_MAX_W     = 320
 local THUMB_PADDING   = 16
@@ -343,49 +349,129 @@ local function showThumbnail(path, img)
     thumbDismissTimer = hs.timer.doAfter(THUMB_DISMISS, dismissThumbnail)
 end
 
-local function processScreenshot(path)
-    if lastProcessed == path then return end
-    local img = hs.image.imageFromPath(path)
-    if not img then return end
-    lastProcessed = path
+-- Reliability tuning for the settle loop.
+local COPY_POLL_S = 0.05   -- re-check the file every 50ms while it's still being written
+local COPY_MAX_S  = 1.5    -- bounded wait: give up after ~1.5s (never hang the watcher)
+-- A complete PNG always ends with the IEND chunk: "IEND" + CRC 0xAE426082. This is the
+-- authoritative "the writer is done" signal — imageFromPath alone is NOT (it decodes a
+-- header-only 1%-written file and reports full dimensions, which is exactly the stale-copy bug).
+local PNG_IEND = "\73\69\78\68\174\66\96\130"
+local TIFF_SCRATCH = "hs_screenshot_tiff_scratch"  -- private pasteboard for building a compact TIFF
 
-    -- Copy to clipboard: PNG (web file inputs) + TIFF (native apps) if available
-    local pngFile = io.open(path, "rb")
-    if not pngFile then return end
-    local pngData = pngFile:read("*a")
-    pngFile:close()
-    if not pngData or #pngData == 0 then return end
+-- Write PNG (authoritative on-disk bytes) + TIFF (native apps) to the pasteboard, then VERIFY
+-- the write actually took (changeCount advanced AND an image UTI is present). Returns true iff verified.
+local function copyToClipboard(path, pngData, img)
+    local clip = { ["public.png"] = pngData }
 
-    local clipData = { ["public.png"] = pngData }
-
-    local tempPath = "/tmp/hs_screenshot_" .. tostring(os.clock()):gsub("%.", "") .. ".tiff"
-    if img:saveToFile(tempPath, "tiff") then
-        local tiffFile = io.open(tempPath, "rb")
-        if tiffFile then
-            clipData["public.tiff"] = tiffFile:read("*a")
-            tiffFile:close()
-        end
+    -- TIFF for legacy native apps. NSImage:saveToFile("tiff") emits a 16-bit, 2x-scaled ~247MB blob
+    -- (~700ms + a bloated pasteboard) — that disk round-trip was the whole latency problem. Instead
+    -- materialize NSImage's own compact 8-bit TIFFRepresentation (~30MB, ~20ms) on a PRIVATE scratch
+    -- pasteboard, so the user's real clipboard is never perturbed by intermediate state.
+    if hs.pasteboard.writeObjects(img, TIFF_SCRATCH) then
+        local tiff = hs.pasteboard.readDataForUTI(TIFF_SCRATCH, "public.tiff")
+        if tiff and #tiff > 0 then clip["public.tiff"] = tiff end
     end
-    os.remove(tempPath)
 
+    local before = hs.pasteboard.changeCount()
     hs.pasteboard.clearContents()
-    hs.pasteboard.writeAllData(clipData)
+    local ok = hs.pasteboard.writeAllData(clip)
+    if (not ok) or hs.pasteboard.changeCount() <= before or not clipboardHasImage() then
+        -- One retry: clear + rewrite before declaring failure.
+        hs.pasteboard.clearContents()
+        hs.pasteboard.writeAllData(clip)
+    end
+    return clipboardHasImage()
+end
 
-    local snd = hs.sound.getByName("Pop")
-    if snd then snd:play() end
+-- One settle iteration. Returns "done" (copied+verified), "gone" (file vanished / hard fail),
+-- or "wait" (still being written — poll again). `st` carries size-stability state across polls.
+local function settleStep(path, startNs, st)
+    local attrs = hs.fs.attributes(path)
+    if not attrs or attrs.mode ~= "file" then return "gone" end
 
-    showThumbnail(path, img)
+    local size = attrs.size or 0
+    if size > 0 and size == st.size then st.count = st.count + 1 else st.count = 0 end
+    st.size = size
+    if size == 0 then return "wait" end
+
+    local f = io.open(path, "rb")
+    if not f then return "wait" end
+    local data = f:read("*a"); f:close()
+    if not data or #data == 0 then return "wait" end
+
+    -- Complete iff the PNG is terminated (IEND) OR the size has been stable ~150ms (fallback for
+    -- any non-IEND edge case, so we never wait the full 1.5s on a genuinely-finished file).
+    local complete = (#data >= 8 and data:sub(-8) == PNG_IEND) or st.count >= 3
+    if not complete then return "wait" end
+
+    local img = hs.image.imageFromPath(path)
+    if not img then return "wait" end
+
+    if copyToClipboard(path, data, img) then
+        local waited = (hs.timer.absoluteTime() - startNs) / 1e6
+        local sz = img:size()
+        slog.f("copied %s — %d bytes, %.0fx%.0f, settled %.0fms, cc=%d",
+               path:match("[^/]+$"), #data, sz.w, sz.h, waited, hs.pasteboard.changeCount())
+        local snd = hs.sound.getByName("Pop"); if snd then snd:play() end
+        showThumbnail(path, img)  -- thumbnail/sound now appear ONLY after a verified copy
+        return "done"
+    end
+    slog.ef("clipboard write failed: %s", path:match("[^/]+$") or path)
+    return "gone"
+end
+
+-- Per-path settle driver. Each screenshot gets its OWN timer (keyed by path) so rapid successive
+-- shots no longer clobber a single shared debounce timer — every one lands independently.
+local function settleScreenshot(path, startNs, st)
+    local status = settleStep(path, startNs, st)
+    if status == "done" then
+        lastProcessed = path          -- dedup marker set ONLY after verified-complete copy
+        screenshotTimers[path] = nil
+        return
+    end
+    if status == "gone" then
+        screenshotTimers[path] = nil
+        return
+    end
+    if (hs.timer.absoluteTime() - startNs) / 1e9 >= COPY_MAX_S then
+        slog.wf("gave up after %.1fs waiting for complete PNG: %s", COPY_MAX_S, path:match("[^/]+$") or path)
+        screenshotTimers[path] = nil
+        return
+    end
+    screenshotTimers[path] = hs.timer.doAfter(COPY_POLL_S, function() settleScreenshot(path, startNs, st) end)
+end
+
+-- Match the FINAL screenshot only. macOS writes "~/Screenshots/.Screenshot X.png" (hidden temp)
+-- then atomically renames it to "Screenshot X.png". Anchoring on the basename with ^ excludes the
+-- incremental dotfile, so we never process a half-written temp.
+local function isScreenshotFinal(path)
+    local name = path:match("[^/]+$")
+    return name ~= nil and name:match("^Screenshot.+%.png$") ~= nil
 end
 
 screenshotWatcher = hs.pathwatcher.new(screenshotDir, function(files)
     for _, path in ipairs(files) do
-        if path:match("Screenshot.+%.png$") then
+        if isScreenshotFinal(path) and lastProcessed ~= path and not screenshotTimers[path] then
             local attrs = hs.fs.attributes(path)
             if attrs and attrs.mode == "file" then
-                if screenshotProcessTimer then screenshotProcessTimer:stop() end
-                screenshotProcessTimer = hs.timer.doAfter(0.1, function() processScreenshot(path) end)
+                slog.f("detected %s (%s bytes)", path:match("[^/]+$"), tostring(attrs.size))
+                local startNs = hs.timer.absoluteTime()
+                local st = { size = -1, count = 0 }
+                -- Reserve the slot immediately (guards duplicate fires) then settle on the next tick.
+                screenshotTimers[path] = hs.timer.doAfter(0, function() settleScreenshot(path, startNs, st) end)
             end
         end
     end
 end)
 screenshotWatcher:start()
+
+-- FSEvents streams can silently stop delivering after sleep/wake — a known cause of screenshots
+-- "randomly" not copying until a reload. Restart the watcher on wake / unlock to self-heal.
+caffeinateWatcher = hs.caffeinate.watcher.new(function(evt)
+    local w = hs.caffeinate.watcher
+    if evt == w.systemDidWake or evt == w.screensDidUnlock or evt == w.sessionDidBecomeActive then
+        if screenshotWatcher then screenshotWatcher:stop(); screenshotWatcher:start() end
+        slog.i("restarted screenshot watcher after wake/unlock")
+    end
+end)
+caffeinateWatcher:start()
