@@ -246,7 +246,11 @@ local THUMB_SLIDE_FPS = 15
 -- 1.1.1 — the window is destroyed solely by Lua __gc — so the stranded canvas stayed fully visible
 -- and still clickable (clicking it re-opened the screenshot in Preview) until a GC happened to run.
 -- On Hammerspoon's idle ~800KB heap that can be days, which is why it looked permanent.
-local function dismissThumbnail()
+-- `only` scopes the dismissal to one specific canvas. A thumbnail stays clickable while it fades, so
+-- a click landing on a FADING thumbnail must not tear down the NEXT one that has already replaced it
+-- — unscoped, that click stopped the successor's timers and hid it barely after it appeared.
+local function dismissThumbnail(only)
+    if only and only ~= thumbCanvas then return end
     if thumbSlideTimer then thumbSlideTimer:stop(); thumbSlideTimer = nil end
     if thumbDismissTimer then thumbDismissTimer:stop(); thumbDismissTimer = nil end
     if not thumbCanvas then return end
@@ -319,14 +323,18 @@ local function showThumbnail(path, img)
 
     thumbCanvas:show()
 
+    -- This call's own canvas. Every callback below addresses it explicitly rather than reading the
+    -- global, so a late callback can only ever act on the thumbnail it belongs to.
+    local thisCanvas = thumbCanvas
+
     -- Arm the dismissal FIRST: nothing below may leave a thumbnail on screen with no scheduled
     -- teardown if it errors.
-    thumbDismissTimer = hs.timer.doAfter(THUMB_DISMISS, dismissThumbnail)
+    thumbDismissTimer = hs.timer.doAfter(THUMB_DISMISS, function() dismissThumbnail(thisCanvas) end)
 
     thumbCanvas:mouseCallback(function(_, message, id, x, y)
         if message == "mouseUp" then
             hs.task.new("/usr/bin/open", nil, {"-a", "Preview", path}):start()
-            dismissThumbnail()
+            dismissThumbnail(thisCanvas)
         end
     end)
     thumbCanvas:canvasMouseEvents(true, true)
@@ -334,7 +342,6 @@ local function showThumbnail(path, img)
     local slideSteps = math.max(1, math.floor(THUMB_SLIDE_DUR * THUMB_SLIDE_FPS))
     local slideStep = 0
     local dist = startX - finalX
-    local thisCanvas = thumbCanvas  -- capture ref to avoid stale global access
     -- Forward-declared so the closure stops its OWN handle: the global may already have been
     -- reassigned to a newer thumbnail's timer by the time this one finishes.
     local slideTimer
