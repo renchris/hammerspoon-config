@@ -64,6 +64,22 @@ server. A ghost appears as `layer=3` + `onscreen=true` while every Lua global is
 hs -c 'return tostring(thumbCanvas)'    # nil, yet a thumbnail is on screen => orphan
 ```
 
+## Clicking a thumbnail replaces the clipboard with an old screenshot
+
+**Symptom**: clicking the thumbnail opens the screenshot in Preview, and a moment later
+the Pop sound replays, a second thumbnail slides in, and the clipboard now holds an older
+screenshot instead of what you had copied.
+
+**Cause** (fixed in the current config): `hs.pathwatcher` watches with file-level FSEvents
+flags, so a *metadata-only* change re-delivers the path. Opening a screenshot makes Preview
+write a `com.apple.quarantine` xattr to it, which re-triggered the watcher. The old dedup
+remembered only the single most recent path, so once any other screenshot had copied in
+between, the stale re-delivery sailed through and was copied again in full.
+
+**Fix**: the dedup is keyed on file identity (`size:mtime`) recorded at copy time. An xattr
+write changes neither, so an unchanged file is ignored; only genuine content changes
+re-trigger a copy.
+
 ## Cmd+Shift+3/4 feels slow
 
 **Symptom**: There's a ~150-200ms delay between the screenshot capture and the

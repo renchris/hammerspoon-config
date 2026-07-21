@@ -220,8 +220,21 @@ local screenshotDir = os.getenv("HOME") .. "/Screenshots"
 thumbCanvas = nil          -- global: prevent GC of visible canvas
 thumbDismissTimer = nil    -- global: prevent GC of active timer
 thumbSlideTimer = nil      -- global: prevent GC of active timer
-lastProcessed = nil        -- global: dedup — set ONLY after a verified-complete copy
+-- Dedup keyed on file IDENTITY (size:mtime), not just "the last path we copied". FSEvents watches
+-- with file-level flags, so a metadata-only change re-delivers the path: opening a screenshot from
+-- the thumbnail makes Preview write a com.apple.quarantine xattr, which used to sail past the
+-- single-slot check whenever another screenshot had copied in between — silently re-copying an OLD
+-- screenshot over the clipboard, replaying the sound and popping a second thumbnail. Size and mtime
+-- are untouched by an xattr write, so an unchanged file is now ignored.
+processedShots = {}        -- global: path -> "size:mtime" recorded ONLY after a verified copy
+processedCount = 0         -- global: entry count, so the table can be bounded
 screenshotTimers = {}      -- global: per-path settle timers (replaces the single debounce timer)
+
+local PROCESSED_MAX = 500  -- bound the table; screenshots per Hammerspoon session are far fewer
+
+local function shotStamp(attrs)
+    return string.format("%d:%d", attrs.size or 0, attrs.modification or 0)
+end
 
 -- Observability: `hs.logger` so future clipboard regressions are visible in the HS console.
 local slog = hs.logger.new("screenshot", "info")
@@ -439,7 +452,14 @@ end
 local function settleScreenshot(path, startNs, st)
     local status = settleStep(path, startNs, st)
     if status == "done" then
-        lastProcessed = path          -- dedup marker set ONLY after verified-complete copy
+        -- Dedup marker set ONLY after a verified-complete copy, stamped with the identity the file
+        -- had when we copied it, so only a genuine content change re-triggers.
+        local a = hs.fs.attributes(path)
+        if a then
+            if processedShots[path] == nil then processedCount = processedCount + 1 end
+            processedShots[path] = shotStamp(a)
+            if processedCount > PROCESSED_MAX then processedShots = {}; processedCount = 0 end
+        end
         screenshotTimers[path] = nil
         return
     end
@@ -465,9 +485,9 @@ end
 
 screenshotWatcher = hs.pathwatcher.new(screenshotDir, function(files)
     for _, path in ipairs(files) do
-        if isScreenshotFinal(path) and lastProcessed ~= path and not screenshotTimers[path] then
+        if isScreenshotFinal(path) and not screenshotTimers[path] then
             local attrs = hs.fs.attributes(path)
-            if attrs and attrs.mode == "file" then
+            if attrs and attrs.mode == "file" and processedShots[path] ~= shotStamp(attrs) then
                 slog.f("detected %s (%s bytes)", path:match("[^/]+$"), tostring(attrs.size))
                 local startNs = hs.timer.absoluteTime()
                 local st = { size = -1, count = 0 }
