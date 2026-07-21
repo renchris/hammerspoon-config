@@ -30,6 +30,40 @@ the `~/Screenshots` directory doesn't exist.
 **Fix**: Restart Hammerspoon. The reload cleanup guard ensures all stale objects
 are cleaned up before re-initialization.
 
+## Thumbnail never goes away
+
+**Symptom**: The floating thumbnail stays in the bottom-right corner indefinitely.
+Clicking it opens the screenshot in Preview but does not dismiss it. Only restarting
+Hammerspoon or the Mac clears it.
+
+**Cause** (fixed in the current config): the fade-out used to be a hand-rolled `hs.timer`
+alpha loop that held the *only* Lua reference to a still-visible canvas inside the timer's
+closure. Clicking the thumbnail during its 300ms fade — or the next screenshot landing in
+that window — stopped the timer and dropped that reference without ever hiding the canvas.
+In Hammerspoon 1.1.1 `hs.canvas:delete()` is merely an alias for `:hide()` (the destroy path
+is commented out upstream), so a canvas window is destroyed *solely* by Lua garbage
+collection. On Hammerspoon's idle sub-megabyte heap a GC can be days away, so the stranded
+canvas stayed fully opaque and still clickable — indistinguishable from a permanent leak.
+
+**Fix**: the fade is delegated to `hs.canvas:hide(seconds)`. Hammerspoon anchors a fading
+canvas in its own Lua registry for the duration and always orders the window out at the end,
+so no interruption can strand it. `dismissThumbnail` also nudges `collectgarbage` so
+ordered-out canvas windows cannot pile up.
+
+**Clearing a stuck thumbnail on an older config** — no restart required:
+
+```bash
+hs -c 'collectgarbage("collect")'   # collects the orphaned canvas immediately
+hs -c 'hs.reload()'                 # or rebuild the Lua state
+```
+
+**Diagnosing**: Hammerspoon's canvas windows are invisible to `hs.window`, so ask the window
+server. A ghost appears as `layer=3` + `onscreen=true` while every Lua global is `nil`:
+
+```bash
+hs -c 'return tostring(thumbCanvas)'    # nil, yet a thumbnail is on screen => orphan
+```
+
 ## Cmd+Shift+3/4 feels slow
 
 **Symptom**: There's a ~150-200ms delay between the screenshot capture and the

@@ -9,7 +9,6 @@ if screenshotWatcher then screenshotWatcher:stop() end
 if thumbCanvas then thumbCanvas:delete() end
 if thumbDismissTimer then thumbDismissTimer:stop() end
 if thumbSlideTimer then thumbSlideTimer:stop() end
-if thumbFadeTimer then thumbFadeTimer:stop() end
 if dockRebindTimer then dockRebindTimer:stop() end
 if screenshotProcessTimer then screenshotProcessTimer:stop() end
 if screenshotTimers then for _, t in pairs(screenshotTimers) do if t then t:stop() end end end
@@ -221,7 +220,6 @@ local screenshotDir = os.getenv("HOME") .. "/Screenshots"
 thumbCanvas = nil          -- global: prevent GC of visible canvas
 thumbDismissTimer = nil    -- global: prevent GC of active timer
 thumbSlideTimer = nil      -- global: prevent GC of active timer
-thumbFadeTimer = nil       -- global: prevent GC of fade-out timer
 lastProcessed = nil        -- global: dedup — set ONLY after a verified-complete copy
 screenshotTimers = {}      -- global: per-path settle timers (replaces the single debounce timer)
 
@@ -237,30 +235,35 @@ local THUMB_FADE      = 0.3
 local THUMB_SLIDE_DUR = 0.25
 local THUMB_SLIDE_FPS = 15
 
+-- Fade-out is delegated to hs.canvas:hide(seconds) instead of a hand-rolled alpha loop, for
+-- CORRECTNESS, not brevity. hs.canvas anchors a fading canvas in Hammerspoon's own Lua registry for
+-- the duration of the fade and always orders the window out at the end, so the fade cannot be
+-- interrupted or abandoned. The loop this replaces held the ONLY reference to a still-VISIBLE canvas
+-- inside a stoppable timer closure, and both callers below stop that timer: a click landing during
+-- the 300ms fade (mouseCallback → dismissThumbnail → stops the fade, then returns early because
+-- thumbCanvas is already nil) or the next screenshot arriving mid-fade would drop the last reference
+-- without ever hiding the window. hs.canvas:delete() is only an alias for :hide() in Hammerspoon
+-- 1.1.1 — the window is destroyed solely by Lua __gc — so the stranded canvas stayed fully visible
+-- and still clickable (clicking it re-opened the screenshot in Preview) until a GC happened to run.
+-- On Hammerspoon's idle ~800KB heap that can be days, which is why it looked permanent.
 local function dismissThumbnail()
     if thumbSlideTimer then thumbSlideTimer:stop(); thumbSlideTimer = nil end
     if thumbDismissTimer then thumbDismissTimer:stop(); thumbDismissTimer = nil end
-    if thumbFadeTimer then thumbFadeTimer:stop(); thumbFadeTimer = nil end
     if not thumbCanvas then return end
     local c = thumbCanvas
     thumbCanvas = nil
-    local steps = math.max(1, math.floor(THUMB_FADE * 30))
-    local step = 0
-    thumbFadeTimer = hs.timer.doEvery(THUMB_FADE / steps, function()
-        step = step + 1
-        if step >= steps then
-            pcall(function() c:delete() end)
-            if thumbFadeTimer then thumbFadeTimer:stop(); thumbFadeTimer = nil end
-            return
-        end
-        pcall(function() c:alpha(1 - step / steps) end)
-    end)
+    pcall(function() c:hide(THUMB_FADE) end)
+    -- Reclaim earlier thumbnails' windows. Because :delete() only hides, a canvas's NSWindow is
+    -- destroyed solely by Lua __gc, and an idle sub-megabyte heap can go days without collecting —
+    -- that delay is what made the stranded thumbnail look permanent. Nudging GC here keeps
+    -- ordered-out canvases from piling up and bounds any future orphan to seconds. Off the capture
+    -- latency path (this runs 3s after the copy) and sub-millisecond on a heap this small.
+    collectgarbage("collect")
 end
 
 local function showThumbnail(path, img)
-    -- Stop any in-progress fade from a previous dismissal (must be before thumbCanvas check
-    -- because dismissThumbnail nils thumbCanvas while fade timer still runs)
-    if thumbFadeTimer then thumbFadeTimer:stop(); thumbFadeTimer = nil end
+    -- A previous thumbnail that is mid-fade needs no handling here: it is owned by hs.canvas until
+    -- its fade completes and it orders itself out. Only the ACTIVE canvas has to be torn down.
     if thumbCanvas then
         if thumbSlideTimer then thumbSlideTimer:stop(); thumbSlideTimer = nil end
         if thumbDismissTimer then thumbDismissTimer:stop(); thumbDismissTimer = nil end
@@ -316,6 +319,10 @@ local function showThumbnail(path, img)
 
     thumbCanvas:show()
 
+    -- Arm the dismissal FIRST: nothing below may leave a thumbnail on screen with no scheduled
+    -- teardown if it errors.
+    thumbDismissTimer = hs.timer.doAfter(THUMB_DISMISS, dismissThumbnail)
+
     thumbCanvas:mouseCallback(function(_, message, id, x, y)
         if message == "mouseUp" then
             hs.task.new("/usr/bin/open", nil, {"-a", "Preview", path}):start()
@@ -328,25 +335,25 @@ local function showThumbnail(path, img)
     local slideStep = 0
     local dist = startX - finalX
     local thisCanvas = thumbCanvas  -- capture ref to avoid stale global access
-    thumbSlideTimer = hs.timer.doEvery(THUMB_SLIDE_DUR / slideSteps, function()
+    -- Forward-declared so the closure stops its OWN handle: the global may already have been
+    -- reassigned to a newer thumbnail's timer by the time this one finishes.
+    local slideTimer
+    slideTimer = hs.timer.doEvery(THUMB_SLIDE_DUR / slideSteps, function()
         slideStep = slideStep + 1
-        if slideStep >= slideSteps then
-            if thisCanvas == thumbCanvas then  -- still the active canvas
+        local done = slideStep >= slideSteps
+        if done or thisCanvas ~= thumbCanvas then  -- finished, or the canvas was replaced
+            if done and thisCanvas == thumbCanvas then
                 thisCanvas:topLeft({ x = finalX, y = finalY })
             end
-            if thumbSlideTimer then thumbSlideTimer:stop(); thumbSlideTimer = nil end
-            return
-        end
-        if thisCanvas ~= thumbCanvas then  -- canvas was replaced
-            if thumbSlideTimer then thumbSlideTimer:stop(); thumbSlideTimer = nil end
+            slideTimer:stop()
+            if thumbSlideTimer == slideTimer then thumbSlideTimer = nil end
             return
         end
         local t = slideStep / slideSteps
         local ease = 1 - (1 - t) ^ 3
         thisCanvas:topLeft({ x = startX - dist * ease, y = finalY })
     end)
-
-    thumbDismissTimer = hs.timer.doAfter(THUMB_DISMISS, dismissThumbnail)
+    thumbSlideTimer = slideTimer
 end
 
 -- Reliability tuning for the settle loop.
