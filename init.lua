@@ -28,9 +28,26 @@ local dockPlist = os.getenv("HOME") .. "/Library/Preferences/com.apple.dock.plis
 local skipNames = {}
 local skipBundleIDs = {}
 
--- Apps where we want to keep ⌥+digits free so tmux can use M-1..M-9
-local terminalApps = {
-  Kitty = true, iTerm2 = true, Terminal = true, WezTerm = true
+-- Terminal apps — keyed by BUNDLE ID, never by display name.
+--
+-- This table used to be name-keyed (`Kitty = true, iTerm2 = true, …`) and it silently missed kitty:
+-- Hammerspoon reports kitty's name as "kitty" (lowercase, from its CFBundleName), so the lookup
+-- `terminalApps[front:name()]` evaluated to nil and BOTH behaviours that depend on this table were
+-- dead in kitty — the ⌥+digits passthrough for tmux, and the ⌘V→⌃V rewrite that lets Claude Code
+-- accept a ⌘⇧4 screenshot from the clipboard. It kept working in iTerm2 for the accidental reason
+-- that iTerm2's CFBundleName is exactly "iTerm2", so its key matched. Verified live 2026-07-31:
+--   terminalApps["kitty"] = nil        (hs.application.find("kitty"):name() == "kitty")
+-- Ghostty was absent altogether, so it never worked there either.
+--
+-- Bundle ids are case-exact, stable across renames, and — unlike a display name — cannot drift with
+-- however the vendor capitalises the app. Same lesson as the AppleScript `application id` fix: an
+-- app is identified by its id, and a name lookup is a silent miss waiting to happen.
+local terminalBundleIDs = {
+  ["net.kovidgoyal.kitty"]   = true,  -- kitty
+  ["com.googlecode.iterm2"]  = true,  -- iTerm2  (bundle on disk is iTerm.app)
+  ["com.mitchellh.ghostty"]  = true,  -- Ghostty
+  ["com.github.wez.wezterm"] = true,  -- WezTerm
+  ["com.apple.Terminal"]     = true,  -- Terminal
 }
 
 hotkeys = {}
@@ -115,8 +132,12 @@ local function setHotkeysEnabled(enabled)
   end
 end
 
-local function isTerminalApp(name)
-  return terminalApps[name] == true
+-- Takes an hs.application OBJECT (not a name), so the decision is made on the bundle id. Callers
+-- that only had a name string now pass the app object the API already hands them.
+local function isTerminalApp(app)
+  if not app then return false end
+  local ok, id = pcall(function() return app:bundleID() end)
+  return ok and id ~= nil and terminalBundleIDs[id] == true
 end
 
 local function rebind()
@@ -138,7 +159,7 @@ local function rebind()
 
   -- Respect current frontmost app for terminal exclusion
   local front = hs.application.frontmostApplication()
-  if front and isTerminalApp(front:name()) then
+  if isTerminalApp(front) then
     setHotkeysEnabled(false)
   end
 
@@ -158,9 +179,11 @@ end)
 pathWatcher:start()
 
 -- Disable ⌥+digits in terminals, enable elsewhere
-appWatcher = hs.application.watcher.new(function(appName, event)
+-- The watcher's THIRD argument is the hs.application object; take the id from it rather than
+-- re-deriving one from appName, which is the name lookup this fix exists to remove.
+appWatcher = hs.application.watcher.new(function(appName, event, appObject)
   if event == hs.application.watcher.activated then
-    setHotkeysEnabled(not isTerminalApp(appName))
+    setHotkeysEnabled(not isTerminalApp(appObject))
   end
 end)
 appWatcher:start()
@@ -172,7 +195,7 @@ manualRefreshHotkey = hs.hotkey.bind({ "alt", "cmd" }, "R", rebind)
 rebind()
 
 -- Smart paste: Cmd+V sends Ctrl+V for images in terminals, Cmd+V otherwise
--- Reuses terminalApps table from Dock bindings above
+-- Reuses the terminalBundleIDs table + isTerminalApp() from the Dock bindings above
 
 local function clipboardHasImage()
     local types = hs.pasteboard.contentTypes()
@@ -197,7 +220,7 @@ smartPasteTap = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(even
     if not flags.cmd or flags.shift or flags.alt or flags.ctrl then return false end
 
     local front = hs.application.frontmostApplication()
-    if not (front and terminalApps[front:name()] and clipboardHasImage()) then
+    if not (isTerminalApp(front) and clipboardHasImage()) then
         return false
     end
 
