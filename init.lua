@@ -13,6 +13,7 @@ if dockRebindTimer then dockRebindTimer:stop() end
 if screenshotProcessTimer then screenshotProcessTimer:stop() end
 if screenshotTimers then for _, t in pairs(screenshotTimers) do if t then t:stop() end end end
 if caffeinateWatcher then caffeinateWatcher:stop() end
+if fsWatchdogTimer then fsWatchdogTimer:stop() end
 if smartPasteTap then smartPasteTap:stop() end
 if appWatcher then appWatcher:stop() end
 if pathWatcher then pathWatcher:stop() end
@@ -506,7 +507,13 @@ local function isScreenshotFinal(path)
     return name ~= nil and name:match("^Screenshot.+%.png$") ~= nil
 end
 
-screenshotWatcher = hs.pathwatcher.new(screenshotDir, function(files)
+-- Named so the watchdog below can re-arm a FRESH watcher with the same behaviour. Re-arming must
+-- build a NEW object: see armScreenshotWatcher for why stop()/start() is not a remedy.
+local function onScreenshotEvent(files)
+    -- Stamp EVERY delivery, before any filtering. This is the only evidence that the FSEvents
+    -- stream is still alive: the watcher object stays non-nil forever whether or not the stream
+    -- is delivering, so liveness cannot be read off our own state (see the watchdog below).
+    fsLastEventNs = hs.timer.absoluteTime()
     for _, path in ipairs(files) do
         if isScreenshotFinal(path) and not screenshotTimers[path] then
             local attrs = hs.fs.attributes(path)
@@ -519,16 +526,90 @@ screenshotWatcher = hs.pathwatcher.new(screenshotDir, function(files)
             end
         end
     end
-end)
-screenshotWatcher:start()
+end
+
+-- Re-arm by REPLACING the object, never by stop()/start().
+--
+-- Measured 2026-08-23, and this is the whole reason the old self-heal below never worked: once this
+-- stream stopped delivering, `screenshotWatcher:stop(); screenshotWatcher:start()` did NOT bring it
+-- back. The watchdog re-armed it that way three times in a row and every subsequent screenshot was
+-- still dropped, with no "detected" line. In the same seconds, on the SAME directory, a freshly
+-- constructed `hs.pathwatcher.new(...)` received events immediately — so FSEvents itself was
+-- healthy and the fault was the dead object refusing to re-register. Restarting a corpse is not a
+-- remedy; only a new watcher is.
+local function armScreenshotWatcher()
+    if screenshotWatcher then pcall(function() screenshotWatcher:stop() end) end
+    screenshotWatcher = hs.pathwatcher.new(screenshotDir, onScreenshotEvent)
+    screenshotWatcher:start()
+    fsLastEventNs = hs.timer.absoluteTime()   -- clean baseline for the fresh stream
+end
+
+armScreenshotWatcher()
 
 -- FSEvents streams can silently stop delivering after sleep/wake — a known cause of screenshots
 -- "randomly" not copying until a reload. Restart the watcher on wake / unlock to self-heal.
 caffeinateWatcher = hs.caffeinate.watcher.new(function(evt)
     local w = hs.caffeinate.watcher
     if evt == w.systemDidWake or evt == w.screensDidUnlock or evt == w.sessionDidBecomeActive then
-        if screenshotWatcher then screenshotWatcher:stop(); screenshotWatcher:start() end
-        slog.i("restarted screenshot watcher after wake/unlock")
+        armScreenshotWatcher()   -- was stop()/start(), which provably does not re-arm a dead stream
+        slog.i("re-armed screenshot watcher after wake/unlock")
     end
 end)
 caffeinateWatcher:start()
+
+-- FSEvents liveness watchdog — the stream can also die while the machine stays AWAKE.
+--
+-- The caffeinate watcher above heals the one cause we knew about (sleep/wake/unlock). It is not
+-- sufficient: measured 2026-08-23 on a machine at load ~32 with fseventsd pegged at 100% CPU, this
+-- stream had silently stopped delivering with no sleep event involved. The failure is invisible
+-- from the inside — `screenshotWatcher` was still a live object, `screenshotTimers` was empty, and
+-- `processedCount` read 296 from earlier successes. Two consecutive screenshots (4.0 MB, then
+-- 483 KB) copied into the folder produced NOT EVEN a "detected" line: the callback never ran, so
+-- every screenshot was dropped in total silence. A stop()/start() fixed it instantly and the next
+-- file copied in 35 ms — which also proves the drop was never a latency or load problem. The copy
+-- path is fast even on a loaded box; the stream was simply gone.
+--
+-- So liveness must be PROVEN, never inferred: make an event happen, then confirm it arrives.
+-- The canary is deliberately named so it does NOT match isScreenshotFinal() — it exercises the
+-- exact same stream without ever entering the screenshot path or touching the clipboard.
+--
+-- Deliberately NOT retroactive: on detecting a dead stream we restart and log, but do not sweep up
+-- screenshots taken while it was down. By the time a 60s probe notices, the user has already
+-- retaken the shot, and silently overwriting whatever they have since copied would be a worse bug
+-- than the one being fixed.
+-- 🚨 GRACE IS SIZED TO THE DELIVERY BAND, NOT TO THE COPY PATH. This distinction is the whole
+-- reason the first cut of this watchdog was wrong, and getting it wrong makes the watchdog a CAUSE
+-- of the bug it is meant to fix. Measured 2026-08-23 on the loaded box: the copy path itself is
+-- 35 ms, but FSEvents took 8.9 SECONDS to deliver the event that starts it — fseventsd was pegged
+-- at 100% of a core by this machine's own file churn (35 Claude sessions, 179 worktrees), and a
+-- saturated fseventsd inflates delivery latency for every client on the system. A 4s grace
+-- therefore fired on a perfectly ALIVE stream: it re-armed three times in a row, and because
+-- re-arming builds a new stream it discards whatever was still in flight — turning a slow
+-- screenshot into a genuinely lost one.
+--
+-- So: grace must exceed the worst delivery latency, not the median. 120s is far above the 8.9s
+-- observed under heavy load while still catching a truly dead stream within ~7 minutes, which is
+-- the right timescale for a failure that is rare and persistent rather than transient.
+local FSWD_INTERVAL = 300  -- probe every 5 min; a dead stream is a rare, persistent condition
+local FSWD_GRACE    = 120  -- an event this old still counts as delivered (band is ~9s, not ~35ms)
+local fswdCanary = screenshotDir .. "/.hs-fsevents-canary"
+fsLastEventNs = fsLastEventNs or hs.timer.absoluteTime()
+fsWatchdogRestarts = fsWatchdogRestarts or 0
+
+fsWatchdogTimer = hs.timer.doEvery(FSWD_INTERVAL, function()
+    if not screenshotWatcher then return end
+    local probeNs = hs.timer.absoluteTime()
+    local f = io.open(fswdCanary, "w")
+    if not f then return end          -- can't probe (folder gone/unwritable) ⇒ assert nothing
+    f:write(tostring(probeNs)); f:close()
+
+    hs.timer.doAfter(FSWD_GRACE, function()
+        -- Alive iff an event landed at or after the probe write. Restarting on a false negative is
+        -- cheap (a stop/start costs nothing and loses nothing); missing a real death is not.
+        if fsLastEventNs and fsLastEventNs >= probeNs then return end
+        fsWatchdogRestarts = fsWatchdogRestarts + 1
+        slog.wf("FSEvents stream stopped delivering (no event in %ds) — re-arming watcher (re-arm #%d)",
+                FSWD_GRACE, fsWatchdogRestarts)
+        pcall(armScreenshotWatcher)   -- replaces the object; stop()/start() does not work here
+    end)
+end)
