@@ -23,15 +23,28 @@ macOS Sequoia intercepts Cmd+Shift+3/4 at the WindowServer level before any user
 app. Hammerspoon cannot override these shortcuts via hotkey binding or event taps.
 
 **Architecture**: Native macOS handles the capture. `show-thumbnail` is disabled so
-files write to disk instantly. A `hs.pathwatcher` on `~/Screenshots` detects new PNGs
-and copies to clipboard + shows a custom floating thumbnail.
+files write to disk instantly. Hammerspoon **polls** `~/Screenshots` — one `stat()` of the
+directory every 50 ms (27 µs each), and a listing only when the directory's
+mtime/ctime/size signature changes — then copies the new PNG to the clipboard and shows a
+custom floating thumbnail on the display under the mouse pointer.
 
 | Step | Handler | Latency |
 |------|---------|---------|
 | 1. Crosshair / capture | macOS native | 0ms (system) |
-| 2. File written to ~/Screenshots | macOS native | ~50ms |
-| 3. Pathwatcher fires | Hammerspoon FSEvents | ~100ms |
-| 4. Clipboard + thumbnail + sound | Hammerspoon | ~200ms |
+| 2. File written to ~/Screenshots | macOS native | ~50ms (renamed into place, complete) |
+| 3. Poll notices the new entry | Hammerspoon `stat` every 50 ms | ≤ 50 ms + ~8 ms listing |
+| 4. Clipboard + thumbnail + sound | Hammerspoon | ~35 ms |
+
+**Why a poll and not FSEvents.** Detection used to be an `hs.pathwatcher` (FSEvents). On
+2026-09-07 this machine was measured at load average 223 with `fseventsd` pinned at 100 % of
+a core for 13 days, fed ~250 client registrations an hour by a fleet of Claude Code sessions.
+Under that, FSEvents delivered events minutes late or never: the liveness watchdog re-armed
+the stream 35 times in one day, every re-arm discarded what was queued, and 5 of the day's 13
+screenshots never even reached the "detected" log line. A `touch` probe was still undelivered
+after 40 s, and a launchd `WatchPaths` agent on the same directory did not fire in 20 s. A
+`stat()` asks the kernel, not `fseventsd`, and answers immediately — so the poll has a hard
+latency bound and nothing to lose. Under normal load the difference is invisible; under this
+load it is the difference between working and not.
 
 ### Clipboard Format
 
@@ -93,9 +106,22 @@ location to Desktop, and stops Hammerspoon. Restores your backup init.lua if one
 
 ## Key Implementation Details
 
-- **Pathwatcher must be global** — `local` variables at init.lua top-level get garbage
-  collected by Lua's GC, silently destroying the watcher. Canvas and timer variables
-  that persist beyond their creating function must also be global.
+- **Poll timer must be global, and created with `continueOnError`** — `local` variables at
+  init.lua top-level get garbage collected by Lua's GC, silently destroying the timer. Canvas
+  and timer variables that persist beyond their creating function must also be global.
+  `hs.timer.doEvery` stops the timer on the first Lua error in its callback, which would
+  turn a transient fault into permanent silent loss of detection — use
+  `hs.timer.new(interval, fn, true)` so errors are logged and the poll goes on.
+- **Same-second renames** — `hs.fs` timestamps are whole seconds and a rename moves no
+  directory entry, so a temp file created and renamed within the same second as the previous
+  change leaves the directory's mtime/ctime/size unchanged. While the directory's mtime is
+  still the current second the poll keeps listing every other tick (≤ ~10 listings), so
+  nothing can slip through the 1 s resolution.
+- **Dedup is by name** — every entry is handled once, the first time it is seen. There is no
+  event stream, so there is no metadata-only re-delivery to defend against (Preview's
+  quarantine xattr on click used to re-trigger the FSEvents path).
+- **Not retroactive** — screenshots already present when the config loads are remembered,
+  never copied: silently overwriting whatever the user has since copied would be worse.
 - **U+202F in filenames** — macOS Sequoia uses NARROW NO-BREAK SPACE (U+202F) between
   the time and AM/PM in screenshot filenames. Lua's `.+` pattern handles this correctly.
 - **`writeAllData` not `writeDataForUTI`** — the latter replaces the entire pasteboard

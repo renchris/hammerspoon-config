@@ -55,7 +55,7 @@ echo "[5/7] Configuring macOS screenshot settings..."
 defaults write com.apple.screencapture location "$HOME/Screenshots"
 echo "  Screenshot location: ~/Screenshots"
 
-# 6. Disable native thumbnail (files save instantly for pathwatcher)
+# 6. Disable native thumbnail (files save instantly, so the directory poll sees them at once)
 echo "[6/7] Disabling native screenshot thumbnail..."
 defaults write com.apple.screencapture show-thumbnail -bool false
 echo "  Native thumbnail disabled (Hammerspoon provides custom thumbnail)"

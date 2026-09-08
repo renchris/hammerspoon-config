@@ -5,15 +5,12 @@
 hs.ipc.cliInstall()
 
 -- Cleanup on reload (prevent duplicate watchers/timers from hs.reload())
-if screenshotWatcher then screenshotWatcher:stop() end
+if screenshotPollTimer then screenshotPollTimer:stop() end
 if thumbCanvas then thumbCanvas:delete() end
 if thumbDismissTimer then thumbDismissTimer:stop() end
 if thumbSlideTimer then thumbSlideTimer:stop() end
 if dockRebindTimer then dockRebindTimer:stop() end
-if screenshotProcessTimer then screenshotProcessTimer:stop() end
 if screenshotTimers then for _, t in pairs(screenshotTimers) do if t then t:stop() end end end
-if caffeinateWatcher then caffeinateWatcher:stop() end
-if fsWatchdogTimer then fsWatchdogTimer:stop() end
 if smartPasteTap then smartPasteTap:stop() end
 if appWatcher then appWatcher:stop() end
 if pathWatcher then pathWatcher:stop() end
@@ -236,32 +233,48 @@ smartPasteTap = hs.eventtap.new({hs.eventtap.event.types.keyDown}, function(even
 end)
 smartPasteTap:start()
 
--- Screenshot clipboard: watch ~/Screenshots for new PNGs, auto-copy to clipboard.
+-- Screenshot clipboard: notice new PNGs in ~/Screenshots, auto-copy to clipboard.
 -- Native Cmd+Shift+3/4 handles capture (Sequoia intercepts before userspace).
 -- show-thumbnail is disabled so files save instantly to disk.
+-- Detection is a directory POLL (see the "Detection is a POLL" block below), never FSEvents:
+-- fseventsd on this machine delivers minutes late or never, and every screenshot it lost was lost
+-- in total silence. Dedup is by NAME — an entry is handled once, the first time it is seen — which
+-- also retires the old size:mtime identity check: with no event stream there is no metadata-only
+-- re-delivery (Preview's quarantine xattr on click) to defend against.
 
 local screenshotDir = os.getenv("HOME") .. "/Screenshots"
 thumbCanvas = nil          -- global: prevent GC of visible canvas
 thumbDismissTimer = nil    -- global: prevent GC of active timer
 thumbSlideTimer = nil      -- global: prevent GC of active timer
--- Dedup keyed on file IDENTITY (size:mtime), not just "the last path we copied". FSEvents watches
--- with file-level flags, so a metadata-only change re-delivers the path: opening a screenshot from
--- the thumbnail makes Preview write a com.apple.quarantine xattr, which used to sail past the
--- single-slot check whenever another screenshot had copied in between — silently re-copying an OLD
--- screenshot over the clipboard, replaying the sound and popping a second thumbnail. Size and mtime
--- are untouched by an xattr write, so an unchanged file is now ignored.
-processedShots = {}        -- global: path -> "size:mtime" recorded ONLY after a verified copy
-processedCount = 0         -- global: entry count, so the table can be bounded
 screenshotTimers = {}      -- global: per-path settle timers (replaces the single debounce timer)
 
-local PROCESSED_MAX = 500  -- bound the table; screenshots per Hammerspoon session are far fewer
-
-local function shotStamp(attrs)
-    return string.format("%d:%d", attrs.size or 0, attrs.modification or 0)
-end
-
--- Observability: `hs.logger` so future clipboard regressions are visible in the HS console.
+-- Observability: `hs.logger` for the HS console, PLUS an append-only file log. The console is wiped
+-- by every reload, and — measured 2026-09-08 — cannot even be read back over hs.ipc while the
+-- machine is loaded (the `hs` CLI aborts on the large reply). A file survives both, and answers
+-- "did the 3:46 PM screenshot copy, and how long did it take?" after the fact:
+--     tail -f ~/Library/Logs/Hammerspoon/screenshot.log
+-- Millisecond timestamps, because the whole pipeline is measured in tens of milliseconds.
+-- Truncated at load once it passes SHOT_LOG_MAX (a screenshot is ~2 lines; that is years).
 local slog = hs.logger.new("screenshot", "info")
+local SHOT_LOG_DIR = os.getenv("HOME") .. "/Library/Logs/Hammerspoon"
+local SHOT_LOG     = SHOT_LOG_DIR .. "/screenshot.log"
+local SHOT_LOG_MAX = 1024 * 1024
+hs.fs.mkdir(SHOT_LOG_DIR)
+do
+    local a = hs.fs.attributes(SHOT_LOG)
+    if a and (a.size or 0) > SHOT_LOG_MAX then os.remove(SHOT_LOG) end
+end
+local function shotlog(level, fmt, ...)
+    local msg = string.format(fmt, ...)
+    if level == "w" then slog.w(msg) elseif level == "e" then slog.e(msg) else slog.i(msg) end
+    local f = io.open(SHOT_LOG, "a")
+    if f then
+        local now = hs.timer.secondsSinceEpoch()
+        f:write(string.format("%s.%03d %s %s\n", os.date("%Y-%m-%d %H:%M:%S", math.floor(now)),
+                              math.floor((now % 1) * 1000), level:upper(), msg))
+        f:close()
+    end
+end
 
 local THUMB_MAX_W     = 320
 local THUMB_PADDING   = 16
@@ -320,7 +333,10 @@ local function showThumbnail(path, img)
     local cw = tw + THUMB_PADDING * 2
     local ch = th + THUMB_PADDING * 2
 
-    local screen = hs.screen.mainScreen():frame()
+    -- The screen the pointer is on: the selection was just drawn there, so that is where the eye is.
+    -- mainScreen() is the screen of the FOCUSED WINDOW, which on a multi-display desk can be the
+    -- other monitor — the thumbnail then slides in where nobody is looking.
+    local screen = (hs.mouse.getCurrentScreen() or hs.screen.mainScreen()):frame()
     local finalX = screen.x + screen.w - cw - 20
     local finalY = screen.y + screen.h - ch - 20
     local startX = screen.x + screen.w + THUMB_SHADOW
@@ -402,7 +418,10 @@ end
 
 -- Reliability tuning for the settle loop.
 local COPY_POLL_S = 0.05   -- re-check the file every 50ms while it's still being written
-local COPY_MAX_S  = 1.5    -- bounded wait: give up after ~1.5s (never hang the watcher)
+-- Bounded wait, sized for a LOADED machine: macOS renames the finished PNG into place, so the
+-- normal case settles on the first poll, but a non-atomic writer (Finder copy, a sync client)
+-- under load 200+ can take seconds. Giving up early strands the file: a name is handled once.
+local COPY_MAX_S  = 10     -- give up after 10s (never hang the poller; one warning line)
 -- A complete PNG always ends with the IEND chunk: "IEND" + CRC 0xAE426082. This is the
 -- authoritative "the writer is done" signal — imageFromPath alone is NOT (it decodes a
 -- header-only 1%-written file and reports full dimensions, which is exactly the stale-copy bug).
@@ -461,155 +480,156 @@ local function settleStep(path, startNs, st)
     if copyToClipboard(path, data, img) then
         local waited = (hs.timer.absoluteTime() - startNs) / 1e6
         local sz = img:size()
-        slog.f("copied %s — %d bytes, %.0fx%.0f, settled %.0fms, cc=%d",
+        shotlog("i", "copied %s — %d bytes, %.0fx%.0f, settled %.0fms, cc=%d",
                path:match("[^/]+$"), #data, sz.w, sz.h, waited, hs.pasteboard.changeCount())
         local snd = hs.sound.getByName("Pop"); if snd then snd:play() end
         showThumbnail(path, img)  -- thumbnail/sound now appear ONLY after a verified copy
         return "done"
     end
-    slog.ef("clipboard write failed: %s", path:match("[^/]+$") or path)
+    shotlog("e", "clipboard write failed: %s", path:match("[^/]+$") or path)
     return "gone"
 end
 
 -- Per-path settle driver. Each screenshot gets its OWN timer (keyed by path) so rapid successive
 -- shots no longer clobber a single shared debounce timer — every one lands independently.
 local function settleScreenshot(path, startNs, st)
-    local status = settleStep(path, startNs, st)
-    if status == "done" then
-        -- Dedup marker set ONLY after a verified-complete copy, stamped with the identity the file
-        -- had when we copied it, so only a genuine content change re-triggers.
-        local a = hs.fs.attributes(path)
-        if a then
-            if processedShots[path] == nil then processedCount = processedCount + 1 end
-            processedShots[path] = shotStamp(a)
-            if processedCount > PROCESSED_MAX then processedShots = {}; processedCount = 0 end
-        end
+    -- A Lua error inside a one-shot timer callback kills only this path's settle, but it does so
+    -- silently and leaves its slot reserved. Contain it: log, free the slot, move on.
+    local ok, status = pcall(settleStep, path, startNs, st)
+    if not ok then
+        shotlog("e", "settle error on %s: %s", path:match("[^/]+$") or path, tostring(status))
         screenshotTimers[path] = nil
         return
     end
-    if status == "gone" then
+    if status == "done" or status == "gone" then
         screenshotTimers[path] = nil
         return
     end
     if (hs.timer.absoluteTime() - startNs) / 1e9 >= COPY_MAX_S then
-        slog.wf("gave up after %.1fs waiting for complete PNG: %s", COPY_MAX_S, path:match("[^/]+$") or path)
+        shotlog("w", "gave up after %.1fs waiting for complete PNG: %s", COPY_MAX_S, path:match("[^/]+$") or path)
         screenshotTimers[path] = nil
         return
     end
     screenshotTimers[path] = hs.timer.doAfter(COPY_POLL_S, function() settleScreenshot(path, startNs, st) end)
 end
 
--- Match the FINAL screenshot only. macOS writes "~/Screenshots/.Screenshot X.png" (hidden temp)
--- then atomically renames it to "Screenshot X.png". Anchoring on the basename with ^ excludes the
--- incremental dotfile, so we never process a half-written temp.
-local function isScreenshotFinal(path)
-    local name = path:match("[^/]+$")
+-- Match the FINAL screenshot only. macOS writes a hidden temp first (".Screenshot X.png" on the
+-- keyboard path; "..name.png-XXXX" then ".name.png" from the CLI) and atomically renames it to
+-- "Screenshot X.png" once the PNG is complete. Anchoring on the basename with ^ excludes every temp
+-- spelling, so the final name is the only one ever handled — and it only ever appears complete.
+local function isScreenshotFinal(name)
     return name ~= nil and name:match("^Screenshot.+%.png$") ~= nil
 end
 
--- Named so the watchdog below can re-arm a FRESH watcher with the same behaviour. Re-arming must
--- build a NEW object: see armScreenshotWatcher for why stop()/start() is not a remedy.
-local function onScreenshotEvent(files)
-    -- Stamp EVERY delivery, before any filtering. This is the only evidence that the FSEvents
-    -- stream is still alive: the watcher object stays non-nil forever whether or not the stream
-    -- is delivering, so liveness cannot be read off our own state (see the watchdog below).
-    fsLastEventNs = hs.timer.absoluteTime()
-    for _, path in ipairs(files) do
-        if isScreenshotFinal(path) and not screenshotTimers[path] then
-            local attrs = hs.fs.attributes(path)
-            if attrs and attrs.mode == "file" and processedShots[path] ~= shotStamp(attrs) then
-                slog.f("detected %s (%s bytes)", path:match("[^/]+$"), tostring(attrs.size))
-                local startNs = hs.timer.absoluteTime()
-                local st = { size = -1, count = 0 }
-                -- Reserve the slot immediately (guards duplicate fires) then settle on the next tick.
-                screenshotTimers[path] = hs.timer.doAfter(0, function() settleScreenshot(path, startNs, st) end)
+-- Detection is a POLL — never FSEvents, and never launchd WatchPaths either.
+--
+-- Measured 2026-09-07/08 on this machine: load average 223 on 10 cores, fseventsd pinned at 100 % of
+-- a core for 13 days, fed ~250 FSEvents client registrations an hour by the Claude Code fleet (the
+-- fseventsd log is a wall of `fsevent_add_client` lines from claude processes). Under that, the
+-- hs.pathwatcher this block replaces delivered events minutes late or not at all:
+--   * its liveness watchdog re-armed it 35 times in ONE day ("no event in 120s"), and because a
+--     re-arm builds a new stream, each one discarded whatever was still queued;
+--   * 5 of the day's 13 screenshots — including all four taken while this was being investigated —
+--     never produced even a "detected" line;
+--   * a `touch` probe on the same directory was still undelivered after 40 s;
+--   * the launchd WatchPaths agent on the same directory did not fire in 20 s either.
+-- A stat() of the directory, meanwhile, costs 27 µs and answers immediately, because it asks the
+-- kernel and not fseventsd. So: stat the directory every SCAN_POLL_S. Its mtime, ctime and size all
+-- change whenever an entry is created, deleted or renamed (APFS reports a directory's size as 32
+-- bytes per entry), so a changed signature means "something happened", and only then is the
+-- directory listed and diffed against the names already seen (~8 ms for 3,300 entries).
+--
+-- The signature alone is not sufficient, and the gap is exactly a same-second rename: hs.fs
+-- timestamps are whole seconds and a rename moves no entry, so a temp file created and renamed
+-- within the SAME second as the previous change leaves mtime, ctime and size all unchanged. While
+-- the directory's mtime is still the current second, therefore, keep scanning every other tick —
+-- at most ~10 scans (~80 ms of CPU), only in the second something changed, never in the idle state.
+-- Worst-case detection latency is one poll interval plus one scan, and there is no queue to lose.
+--
+-- The poll timer is created with continueOnError = true. hs.timer.doEvery defaults to stopping the
+-- timer on the first Lua error in its callback, which would turn any transient fault (a directory
+-- that momentarily fails to list) into a silent, permanent loss of detection — the very failure
+-- shape this rewrite exists to remove. Errors are logged and the poll goes on.
+local SCAN_POLL_S = 0.05   -- one 27 µs stat per tick; detection latency ≤ 50 ms + one scan
+local HOT_EVERY   = 2      -- while the change-second is still current, scan every 2nd tick
+
+knownEntries        = {}   -- global: basename -> true for every entry already seen (dedup by name)
+screenshotPollTimer = nil  -- global: prevent GC of the poll timer
+local dirSig        = nil  -- last observed "mtime:ctime:size" of the directory
+local tickCount     = 0
+local dirWarned     = false
+local scanErrWarned = false
+
+-- List the directory and start a settle for every screenshot not seen before. `markOnly` is the
+-- startup pass: everything already present is remembered but NOT copied. Deliberately not
+-- retroactive — a screenshot taken before a reload was already handled (or the user has long since
+-- retaken it), and overwriting whatever they have since copied would be a worse bug than the one
+-- being fixed.
+local function scanScreenshotDir(markOnly)
+    local found = {}
+    local ok, err = pcall(function()
+        for name in hs.fs.dir(screenshotDir) do
+            if not knownEntries[name] then
+                knownEntries[name] = true
+                if not markOnly and isScreenshotFinal(name) then found[#found + 1] = name end
             end
+        end
+    end)
+    if not ok then
+        if not scanErrWarned then
+            shotlog("e", "cannot list %s: %s", screenshotDir, tostring(err))
+            scanErrWarned = true
+        end
+        return
+    end
+    scanErrWarned = false
+    table.sort(found)   -- oldest first when several land in one scan (names embed the time)
+    for _, name in ipairs(found) do
+        local path = screenshotDir .. "/" .. name
+        local attrs = hs.fs.attributes(path)
+        if attrs and attrs.mode == "file" and not screenshotTimers[path] then
+            shotlog("i", "detected %s (%s bytes, %ds old)", name, tostring(attrs.size),
+                   os.time() - (attrs.modification or os.time()))
+            local startNs = hs.timer.absoluteTime()
+            local st = { size = -1, count = 0 }
+            -- Reserve the slot immediately (guards duplicate fires) then settle on the next tick.
+            screenshotTimers[path] = hs.timer.doAfter(0, function() settleScreenshot(path, startNs, st) end)
         end
     end
 end
 
--- Re-arm by REPLACING the object, never by stop()/start().
---
--- Measured 2026-08-23, and this is the whole reason the old self-heal below never worked: once this
--- stream stopped delivering, `screenshotWatcher:stop(); screenshotWatcher:start()` did NOT bring it
--- back. The watchdog re-armed it that way three times in a row and every subsequent screenshot was
--- still dropped, with no "detected" line. In the same seconds, on the SAME directory, a freshly
--- constructed `hs.pathwatcher.new(...)` received events immediately — so FSEvents itself was
--- healthy and the fault was the dead object refusing to re-register. Restarting a corpse is not a
--- remedy; only a new watcher is.
-local function armScreenshotWatcher()
-    if screenshotWatcher then pcall(function() screenshotWatcher:stop() end) end
-    screenshotWatcher = hs.pathwatcher.new(screenshotDir, onScreenshotEvent)
-    screenshotWatcher:start()
-    fsLastEventNs = hs.timer.absoluteTime()   -- clean baseline for the fresh stream
+local function pollScreenshotDir()
+    local a = hs.fs.attributes(screenshotDir)
+    if not a or a.mode ~= "directory" then
+        if not dirWarned then
+            shotlog("w", "%s is missing — screenshots cannot be detected until it exists", screenshotDir)
+            dirWarned = true
+        end
+        return
+    end
+    dirWarned = false
+    tickCount = tickCount + 1
+    local sig = string.format("%d:%d:%d", a.modification or 0, a.change or 0, a.size or 0)
+    local changed = sig ~= dirSig
+    -- Hot: the directory's latest change is in the current second, so a further change in this
+    -- same second could not alter the signature. Keep looking until the clock moves on.
+    local hot = (a.modification or 0) >= os.time()
+    if changed or (hot and tickCount % HOT_EVERY == 0) then
+        dirSig = sig
+        scanScreenshotDir(false)
+    end
 end
 
-armScreenshotWatcher()
-
--- FSEvents streams can silently stop delivering after sleep/wake — a known cause of screenshots
--- "randomly" not copying until a reload. Restart the watcher on wake / unlock to self-heal.
-caffeinateWatcher = hs.caffeinate.watcher.new(function(evt)
-    local w = hs.caffeinate.watcher
-    if evt == w.systemDidWake or evt == w.screensDidUnlock or evt == w.sessionDidBecomeActive then
-        armScreenshotWatcher()   -- was stop()/start(), which provably does not re-arm a dead stream
-        slog.i("re-armed screenshot watcher after wake/unlock")
-    end
-end)
-caffeinateWatcher:start()
-
--- FSEvents liveness watchdog — the stream can also die while the machine stays AWAKE.
---
--- The caffeinate watcher above heals the one cause we knew about (sleep/wake/unlock). It is not
--- sufficient: measured 2026-08-23 on a machine at load ~32 with fseventsd pegged at 100% CPU, this
--- stream had silently stopped delivering with no sleep event involved. The failure is invisible
--- from the inside — `screenshotWatcher` was still a live object, `screenshotTimers` was empty, and
--- `processedCount` read 296 from earlier successes. Two consecutive screenshots (4.0 MB, then
--- 483 KB) copied into the folder produced NOT EVEN a "detected" line: the callback never ran, so
--- every screenshot was dropped in total silence. A stop()/start() fixed it instantly and the next
--- file copied in 35 ms — which also proves the drop was never a latency or load problem. The copy
--- path is fast even on a loaded box; the stream was simply gone.
---
--- So liveness must be PROVEN, never inferred: make an event happen, then confirm it arrives.
--- The canary is deliberately named so it does NOT match isScreenshotFinal() — it exercises the
--- exact same stream without ever entering the screenshot path or touching the clipboard.
---
--- Deliberately NOT retroactive: on detecting a dead stream we restart and log, but do not sweep up
--- screenshots taken while it was down. By the time a 60s probe notices, the user has already
--- retaken the shot, and silently overwriting whatever they have since copied would be a worse bug
--- than the one being fixed.
--- 🚨 GRACE IS SIZED TO THE DELIVERY BAND, NOT TO THE COPY PATH. This distinction is the whole
--- reason the first cut of this watchdog was wrong, and getting it wrong makes the watchdog a CAUSE
--- of the bug it is meant to fix. Measured 2026-08-23 on the loaded box: the copy path itself is
--- 35 ms, but FSEvents took 8.9 SECONDS to deliver the event that starts it — fseventsd was pegged
--- at 100% of a core by this machine's own file churn (35 Claude sessions, 179 worktrees), and a
--- saturated fseventsd inflates delivery latency for every client on the system. A 4s grace
--- therefore fired on a perfectly ALIVE stream: it re-armed three times in a row, and because
--- re-arming builds a new stream it discards whatever was still in flight — turning a slow
--- screenshot into a genuinely lost one.
---
--- So: grace must exceed the worst delivery latency, not the median. 120s is far above the 8.9s
--- observed under heavy load while still catching a truly dead stream within ~7 minutes, which is
--- the right timescale for a failure that is rare and persistent rather than transient.
-local FSWD_INTERVAL = 300  -- probe every 5 min; a dead stream is a rare, persistent condition
-local FSWD_GRACE    = 120  -- an event this old still counts as delivered (band is ~9s, not ~35ms)
-local fswdCanary = screenshotDir .. "/.hs-fsevents-canary"
-fsLastEventNs = fsLastEventNs or hs.timer.absoluteTime()
-fsWatchdogRestarts = fsWatchdogRestarts or 0
-
-fsWatchdogTimer = hs.timer.doEvery(FSWD_INTERVAL, function()
-    if not screenshotWatcher then return end
-    local probeNs = hs.timer.absoluteTime()
-    local f = io.open(fswdCanary, "w")
-    if not f then return end          -- can't probe (folder gone/unwritable) ⇒ assert nothing
-    f:write(tostring(probeNs)); f:close()
-
-    hs.timer.doAfter(FSWD_GRACE, function()
-        -- Alive iff an event landed at or after the probe write. Restarting on a false negative is
-        -- cheap (a stop/start costs nothing and loses nothing); missing a real death is not.
-        if fsLastEventNs and fsLastEventNs >= probeNs then return end
-        fsWatchdogRestarts = fsWatchdogRestarts + 1
-        slog.wf("FSEvents stream stopped delivering (no event in %ds) — re-arming watcher (re-arm #%d)",
-                FSWD_GRACE, fsWatchdogRestarts)
-        pcall(armScreenshotWatcher)   -- replaces the object; stop()/start() does not work here
-    end)
-end)
+-- Arm: remember what is already there, drop the retired FSEvents watchdog's canary, start polling.
+scanScreenshotDir(true)
+os.remove(screenshotDir .. "/.hs-fsevents-canary")
+screenshotPollTimer = hs.timer.new(SCAN_POLL_S, function()
+    local ok, err = pcall(pollScreenshotDir)
+    if not ok then shotlog("e", "poll error: %s", tostring(err)) end
+end, true)
+screenshotPollTimer:start()
+do
+    local n = 0
+    for _ in pairs(knownEntries) do n = n + 1 end
+    shotlog("i", "screenshot poll armed on %s — %d entries known, every %.0f ms", screenshotDir, n, SCAN_POLL_S * 1000)
+end
