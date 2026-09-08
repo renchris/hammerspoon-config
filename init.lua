@@ -523,10 +523,11 @@ end
 
 -- Detection is a POLL — never FSEvents, and never launchd WatchPaths either.
 --
--- Measured 2026-09-07/08 on this machine: load average 223 on 10 cores, fseventsd pinned at 100 % of
--- a core for 13 days, fed ~250 FSEvents client registrations an hour by the Claude Code fleet (the
--- fseventsd log is a wall of `fsevent_add_client` lines from claude processes). Under that, the
--- hs.pathwatcher this block replaces delivered events minutes late or not at all:
+-- Measured 2026-09-07/08 on this machine: fseventsd pinned at ~100 % of a core and delivering
+-- NOTHING — a follow-up investigation found one daemon thread livelocked in user space for about a
+-- day (claude-infrastructure docs/research/fseventsd-churn-2026-09-08.md); restarting the daemon
+-- with a plain SIGTERM restored delivery in 35 ms. Under that, the hs.pathwatcher this block
+-- replaces delivered events minutes late or not at all:
 --   * its liveness watchdog re-armed it 35 times in ONE day ("no event in 120s"), and because a
 --     re-arm builds a new stream, each one discarded whatever was still queued;
 --   * 5 of the day's 13 screenshots — including all four taken while this was being investigated —

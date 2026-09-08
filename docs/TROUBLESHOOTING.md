@@ -33,23 +33,29 @@ silence" below. Detection is now a directory poll, so what remains is mundane:
 show no thumbnail either. The old console showed
 `FSEvents stream stopped delivering (no event in 120s) — re-arming watcher` every few minutes.
 
-**Cause**: `fseventsd` saturated. Measured on this machine: load average 223 on 10 cores,
-`fseventsd` at 100 % of a core for 13 days, fed ~250 `fsevent_add_client` registrations an
-hour by Claude Code sessions. Every FSEvents consumer on the box is delayed by minutes —
-Hammerspoon's `hs.pathwatcher`, and launchd `WatchPaths` too (a probe on the same directory
-did not fire in 20 s). The liveness watchdog made it worse: each re-arm built a new stream
-and discarded whatever was still queued, so a slow screenshot became a lost one. 5 of one
-day's 13 screenshots never produced a `detected` line.
+**Cause**: `fseventsd` livelocked. Measured on this machine 2026-09-08: one `fseventsd`
+thread spinning at ~98 % user CPU with every other thread idle, delivering nothing — a
+Node `fs.watch` on a test directory timed out 3 of 3 times at 30 s while a polling
+`fs.watchFile` on the same directory saw the change in 104 ms. Every FSEvents consumer on
+the box went blind at once — Hammerspoon's `hs.pathwatcher`, and launchd `WatchPaths` too (a
+probe on the same directory did not fire in 20 s). The liveness watchdog made it worse: each
+re-arm built a new stream and discarded whatever was still queued, so a slow screenshot
+became a lost one. 5 of one day's 13 screenshots never produced a `detected` line. (The
+first read of this incident blamed the Claude Code fleet's ~250 FSEvents client
+registrations an hour; a follow-up investigation showed those were a symptom, not the cost.)
 
-**Fix**: detection is a 50 ms `stat()` poll of the directory — it asks the kernel, not
-`fseventsd` (README § "Why a poll and not FSEvents"). Nothing in `init.lua` depends on
-FSEvents for screenshots any more. To see whether `fseventsd` is still saturated, and who
-is feeding it:
+**Fix, in Hammerspoon**: detection is a 50 ms `stat()` poll of the directory — it asks the
+kernel, not `fseventsd` (README § "Why a poll and not FSEvents"). Nothing in `init.lua`
+depends on FSEvents for screenshots any more, so a wedged daemon cannot lose a screenshot.
+
+**Fix, for the daemon** (everything else on the Mac that watches files): restart it.
+`sudo launchctl kickstart -k system/com.apple.fseventsd` is refused under System Integrity
+Protection (error 150); a plain signal is not, and launchd respawns the daemon. Delivery came
+back in 35 ms after this, and the CPU fell from ~100 % to ~1 %:
 
 ```bash
-ps -o %cpu= -p "$(pgrep -x fseventsd)"
-log show --last 1h --predicate 'process == "fseventsd" AND eventMessage CONTAINS "add_client"' \
-  --style compact | grep -oE 'pid [0-9]+' | sort | uniq -c | sort -rn | head
+ps -o pid=,%cpu= -p "$(pgrep -x fseventsd)"      # ~100% with nothing being delivered = livelocked
+sudo kill -TERM "$(pgrep -x fseventsd)"          # launchd respawns it; one extra Spotlight/Time Machine scan at most
 ```
 
 ## Clipboard flips to an OLDER screenshot a moment later

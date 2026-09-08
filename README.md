@@ -36,15 +36,16 @@ custom floating thumbnail on the display under the mouse pointer.
 | 4. Clipboard + thumbnail + sound | Hammerspoon | ~35 ms |
 
 **Why a poll and not FSEvents.** Detection used to be an `hs.pathwatcher` (FSEvents). On
-2026-09-07 this machine was measured at load average 223 with `fseventsd` pinned at 100 % of
-a core for 13 days, fed ~250 client registrations an hour by a fleet of Claude Code sessions.
-Under that, FSEvents delivered events minutes late or never: the liveness watchdog re-armed
-the stream 35 times in one day, every re-arm discarded what was queued, and 5 of the day's 13
-screenshots never even reached the "detected" log line. A `touch` probe was still undelivered
-after 40 s, and a launchd `WatchPaths` agent on the same directory did not fire in 20 s. A
-`stat()` asks the kernel, not `fseventsd`, and answers immediately — so the poll has a hard
-latency bound and nothing to lose. Under normal load the difference is invisible; under this
-load it is the difference between working and not.
+2026-09-07 this machine's `fseventsd` was found pinned at ~100 % of a core and delivering
+nothing: the liveness watchdog re-armed the stream 35 times in one day, every re-arm discarded
+what was queued, and 5 of the day's 13 screenshots never even reached the "detected" log line.
+A `touch` probe was still undelivered after 40 s, and a launchd `WatchPaths` agent on the same
+directory did not fire in 20 s. A follow-up investigation (claude-infrastructure,
+`docs/research/fseventsd-churn-2026-09-08.md`) showed the daemon was **livelocked** — one thread
+spinning in user space for about a day — not overloaded by its clients, and that restarting it
+(`sudo kill -TERM <pid>`; `launchctl kickstart` is refused under SIP) restored delivery in 35 ms.
+A `stat()` asks the kernel, not `fseventsd`, and answers immediately whether or not the daemon
+is healthy — so the poll has a hard latency bound and nothing to lose. It stays.
 
 ### Clipboard Format
 
