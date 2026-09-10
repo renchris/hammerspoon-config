@@ -22,12 +22,13 @@ is currently unsupervised.
 
 | metric | today (measured) | target |
 |---|---|---|
-| screenshots that reach the clipboard with a thumbnail | not 100 % (5.4 h outage; 3 of 9 lost last night; stalls) | **100.00 %** — 0 of N≥50 bench shots lost, 0 real shots without a `copied` record over 7 days |
+| screenshots that reach the clipboard with a thumbnail | not 100 % (5.4 h outage; 3 of 9 lost last night; stalls) | **100.00 %** — 0 of N = 300 bench shots lost (L1), clipboard bytes == file bytes N of N (L2), the later of two same-scan shots wins N of N (L3), 0 real shots without a `copied` record over 7 days |
 | PNG-complete → clipboard verified | rename-bound: 243 ms p50, 5.0 s p90, 10.2 s max | **≤ 15 ms p50, ≤ 30 ms p100** (10 ms poll + ≤ 1 ms PNG write + verify) |
 | capture (mouse-up) → clipboard verified | 243 ms p50 / 10.2 s max | **≤ 70 ms p50, ≤ 250 ms p99** (bounded by Apple's PNG write: 35 ms p50, 162 ms p99) |
 | capture → thumbnail fully visible | copied + 250 ms slide | **≤ 200 ms p50** (copied + ≤ 120 ms entrance) |
 | detector downtime after a SIGTERM/crash | hours (no supervision) | **≤ 2 s** (launchd respawn 0.05 s + Hammerspoon start) and the shot taken during it is still copied |
-| main-thread blocking on the poll path | python3 spawn (54 ms–seconds), TIFF 55 ms, 10 hot rescans/s | **0 synchronous spawns, 0 encodes > 5 ms, 0 listings without a size change** |
+| main-thread blocking on the poll path | python3 spawn (54–78 ms idle, seconds under load), TIFF 55 ms, Pop 7 ms, 10 hot rescans/s | **0 synchronous spawns, 0 encodes > 5 ms, 0 listings without a size change; bench R1 max tick gap ≤ 75 ms, R2 zero main-thread blocks > 100 ms** |
+| bench sample size | previous verifications used N = 3–10 | **N = 300 default** (a 1.1 % stall needs N ≈ 209 for 90 % odds of one observation); `analyze.py` prints the observed stall count and `INSUFFICIENT-N` when none was seen |
 
 ---
 
@@ -135,8 +136,11 @@ the PNG-only pasteboard write is 0.5 ms and is exactly what Claude Code reads (K
    `f:seek("set", size − 8)` and read 8 bytes until they equal IEND (0.17 ms) — IEND only, no
    size-stability fallback (the streaming temp plateaus between 16 KB chunks and must never be
    copied early). Cap 15 s, then one `W` line, close the handle and release.
-4. **Copy**: read the file once (3 ms for 2.4 MB), `hs.pasteboard.writeAllData(nil, {["public.png"]=bytes})`,
-   verify `changeCount` advanced and `contentTypes` contains `public.png` (one retry). No TIFF: the
+4. **Copy**: read the file once through the handle (3 ms for 2.4 MB),
+   `hs.pasteboard.writeAllData(nil, {["public.png"]=bytes})`, verify `changeCount` advanced and that
+   `readDataForUTI(nil, "public.png")` returns the same byte length (a UTI merely being present is
+   not verification — F1 L2), one retry; a monotonic sequence number guards the write so that when
+   two shots settle in one scan the later capture ends on the clipboard (F1 L3). No TIFF: the
    pasteboard server serves TIFF readers by translation (KB §F5); `SCREENSHOT_TIFF=true` re-enables
    a second write 60 ms later for the day a consumer proves it needs one.
 5. **Dedup by inode, recorded on verified copy** (`copied[ino] = {path, t}`) — never at detection
@@ -177,32 +181,91 @@ entrance, replace with `hs.mouse.absolutePosition()` + `hs.screen.allScreens()` 
 ## Phase 4 — Thumbnail: fastest visible, same guarantees (W1; numbers from E1 when it lands)
 
 **Design.** Keep hs.canvas and every lifecycle fix already learned (`:hide(seconds)` fade,
-per-canvas scoped callbacks, GC nudge on dismiss, pointer-display placement). Build the canvas from
-a pre-scaled 320 px image; entrance = a 120 ms slide at 60 fps (`hs.timer` at 16 ms measured max
-18 ms) or, if E1 measures the loop as costlier than ~1 ms/tick, a `:show(0.12)` fade-in with no
-movement. Click opens the current path for the inode (resolved at click time). Dismiss at 3 s as
+per-canvas scoped callbacks, GC nudge on dismiss, pointer-display placement). Measured defect to
+fix (F1 §5.2): today `THUMB_SLIDE_DUR/THUMB_SLIDE_FPS` yields **3 frames**, the canvas is shown at
+x = screen width + 12 (fully off-screen) and the first on-screen pixel appears 83 ms after
+`show()` — a third of the visible budget. New entrance: first frame already ~70 % on-screen, then
+a 120 ms slide at 60 fps (`hs.timer` at 16 ms measured max 18 ms) — or, if E1 measures the loop as
+costlier than ~1 ms/tick, a `:show(0.12)` fade-in with no movement — and `phase=thumb-visible`
+logged at the first tick whose on-screen fraction ≥ 0.10. Build the canvas from a pre-scaled 320 px
+image. Click opens the current path for the inode (resolved at click time). Dismiss at 3 s as
 today. `behaviorAsLabels` adds `fullScreenAuxiliary` if the bench shows the canvas hidden over a
 fullscreen Space (unverified; KB §F8 item 10).
 
 ## Phase 5 — Structure and proof (W1 for the split, W3 for the bench)
 
-**5a Module split** (`init.lua` → thin loader): `screenshot.lua` (Phases 2–4), `dock.lua`,
-`smartpaste.lua`, `lib/log.lua`; each module returns `{start=…, stop=…}`; `init.lua` calls `stop()`
-of the previous load's modules (kept in a global table) then `start()` — reload-safe by
-construction; all long-lived objects are held in module tables reachable from a global (the
-documented GC trap). README and TROUBLESHOOTING updated in the same wave.
+**5a Module split** — adopted from the F1 report (scratchpad `reports/F1-module-structure.v1-08h46.md`,
+measured 2026-09-10). Three measured facts decide the shape:
+- **The repo is not on `package.path`** (only `~/.hammerspoon` is, built in Hammerspoon's
+  `setup.lua`; the config dir is real and only `init.lua` inside it is a symlink). Bootstrap, first
+  thing in `init.lua`: `local ROOT = (hs.fs.symlinkAttributes(hs.configdir .. "/init.lua", "target")
+  or (hs.configdir .. "/init.lua")):match("(.*)/"); package.path = ROOT .. "/?.lua;" .. ROOT ..
+  "/?/init.lua;" .. package.path`. Degrades correctly when `init.lua` is not a symlink.
+- **The reload guard at `init.lua:7-20` is dead code**: `hs.reload()` builds a fresh Lua
+  environment, so every global it tests is already nil. Replace with the sanctioned surface: a
+  module registry plus `hs.shutdownCallback` that calls each module's `stop()` in reverse order,
+  each in its own `pcall` (synchronous `:stop()`/`:delete()` only).
+- **Globals are unnecessary for GC safety**: a table reachable from `package.loaded` anchors a
+  timer exactly as well (measured: 50 ticks vs 0 for an unanchored local). No feature global remains.
 
-**5b Bench** (`scripts/screenshot-bench.sh N [--quick|--stall]` + `bench.lua`): refuses to run
-unless HIDIdleTime ≥ 60 s (unless `--force`); snapshots the general pasteboard via
-`hs.pasteboard.readAllData()` and restores it at the end; drives N `screencapture -x -R` captures
-named `Screenshot <ts> hs-bench-N.png` into `~/Screenshots` with ns timestamps of process start,
-file birth/mtime/ctime; parses `screenshot.log`; asks Hammerspoon (via the file log, never IPC) for
-`thumb` timestamps and confirms visibility through `CGWindowList` once per run; prints `lost k/N`
-and the p50/p99/p100 of `png-complete→copied`, `capture→copied`, `capture→thumb`; deletes its files.
-**Honest limit:** `-R` is not the keyboard path (no SystemUIServer, different temp spelling), so
-the keyboard path is proven by 7 days of real use (every real shot has a `copied` record) and,
-optionally, by an operator-run synthetic ⌘⇧4 + drag via `hs.eventtap` in `bench.lua --keyboard`
-(idle-guarded, aborts on pointer movement).
+Tree: `init.lua` (~45 lines: bootstrap, config, start loop, shutdownCallback) · `hsc/log.lua` ·
+`hsc/clock.lua` · `hsc/apps.lua` (the terminal bundle-id table shared by dock + smartpaste — never
+duplicated, the defect `2bf64de` fixed) · `hsc/dock.lua` (`hs.plist.read`, 9.2 ms measured, 6.7×
+faster than the python spawn) · `hsc/smartpaste.lua` · `hsc/screenshot/{init,watcher,settle,
+clipboard,thumbnail}.lua` (watcher and settle pure and testable) · `bench/{run.py, winprobe.swift,
+analyze.py}`. Module contract for all: `M.start(cfg)` / `M.stop()` idempotent and safe when never
+started, `M.stats()` a plain table for `hs -c` and the harness. **What the split must NOT change**:
+the ordering guarantees from commits `664d809`, `e4713ad`, `8e0173a`, `85b003c` (dismiss armed
+before the mouse callback, callbacks addressing their own canvas, the slide timer stopping its own
+handle, fade via `hs.canvas:hide(s)`) are ported as literal code with their comments.
+
+Three defects the split surfaces (all measured by F1) are fixed in W1: (a) `table.sort(found)` on
+names orders same-scan shots wrongly on 67 % of days (non-zero-padded 12-hour hour) — order by
+creation time, and guard the clipboard write with a monotonic sequence so two shots in one scan
+leave the LATER one on the clipboard; (b) `hs.sound.getByName("Pop")` costs 7 ms inside the settle
+path — hoist to module load; (c) the fixed-name TIFF scratch pasteboard is never deleted — with
+PNG-only it disappears; any scratch pasteboard uses `uniquePasteboard()` + `deletePasteboard`.
+Also: `knownEntries` is add-only forever (a Trash-restored screenshot with a burned name is never
+copied and never logged) — `seen` becomes a bounded structure re-synced from the listing, with a
+`forget(name)` used by the bench. README and TROUBLESHOOTING updated in the same wave (the
+"ask the window server" section should show the prober, not `hs -c`).
+
+**5b Bench** — architecture adopted from F1. One long-lived driver `bench/run.py` (never a spawn
+per sample): preflight (Hammerspoon pid, `~/Screenshots` writable, single-item pasteboard — refuse a
+multi-item clipboard, `readAllData` only preserves the first item) → presence gate
+(`hs.host.idleTime()` ≥ 180 s to start; abort before the next capture on any pointer delta or
+idle < 5 s; abort still restores the clipboard and deletes files) → snapshot the general pasteboard
+→ N iterations of `screencapture -x -R <rect> ~/Screenshots/"Screenshot BENCH <run-uuid> <seq>.png"`
+(unique per run AND per iteration — a deleted name stays burned in the dedup, so reuse would score
+every repeat as a loss) with ≥ 2 s spacing → wait for `phase=copied|lost` (deadline 15 s) → verify
+`sha1(pasteboard public.png) == sha1(file)` → delete the file only after copied/lost → restore the
+clipboard (assert UTI set and byte lengths identical) → `bench/analyze.py`.
+**Clock**: `hs.timer.absoluteTime()`, `mach_absolute_time()` and Python's `time.monotonic_ns()` are
+the same clock with no offset (measured), and APFS records mtime at µs resolution, so `t0` is the
+kernel-recorded mtime of the capture — no poller in the loop. **Thumbnail visibility** is emitted
+in-process (`phase=thumb-visible` at the first slide tick whose geometric predicate holds) and
+falsified by `bench/winprobe.swift` (`CGWindowListCopyWindowInfo`, one process for the whole run):
+Hammerspoon's canvas is the second window at `layer=3`; **`kCGWindowIsOnscreen` means ordered-in,
+not on a display** (a canvas at (4000,4000) reports onscreen=true), so visibility is
+`area(bounds ∩ screen fullFrame)/area(bounds) ≥ 0.10`. The prober's own scheduling gap reaches
+89 ms under this load, so it is the falsifier, never the clock; a disagreement > 100 ms fails the
+iteration. Bench mode sets `sound=false` and `dismiss=0.4`; `analyze.py` records the mode and never
+compares percentiles across modes. **Log**: `hsc/log.lua` emits one logfmt line per phase —
+`id=` 6 hex chars from the inode (so `created`/`complete` can be logged against the hidden name),
+`mono=` ns verbatim, `dt=` ns since `created`, bare values with `file=` always last, a closed phase
+vocabulary (`created · capture-complete · detected · settling · copied · thumb-shown · thumb-visible
+· dismissed · lost · error`), `phase=lost` emitted by a deadline timer so a loss is a positive
+record, rotation on write. The old `Ns old` field goes. **Invalidation**: a Hammerspoon pid change
+mid-run invalidates the run (its arm pass marks pending files known).
+**Honest limits (stated in the harness output)**: `-R` reproduces the keyboard path's file writes
+byte-for-byte in sequence (F1, n = 11) but not the interactive phase, so it measures
+capture-complete → clipboard, never hotkey → clipboard; its log line reads `launched with
+commandline`, which lets the harness identify its own captures; `-R` geometry is points, output is
+pixels at display scale; every `-R` contacts `mds`, so 300 captures load the very daemon whose stall
+is being measured — report the observed stall rate against the 30-day 1.1 % baseline as a validity
+check. The keyboard path itself is proven by 7 days of real use (every real shot has a `copied`
+record and the log names its hidden-name lifecycle) and, optionally, by an operator-run synthetic
+⌘⇧4 + drag via `hs.eventtap` (`bench/run.py --keyboard`, idle-guarded).
 
 ## Phase 6 — Retire the fallback clipboard agent (W4, claude-infrastructure)
 
