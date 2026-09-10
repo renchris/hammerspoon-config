@@ -15,8 +15,10 @@ This document is the implementation plan; its waves are executed as dispatched s
 **Status:** plan written 2026-09-10 08:45 CDT; K2 verified by two independent refuters at 11:4x
 (corrections adopted in Phase 2); the remaining verifications and gap-fill axes died twice on
 5-hour session limits and are named in § Verification ledger, not bridged.
-Nothing in Phases 1–6 has been implemented yet. Hammerspoon was relaunched by hand at 00:20:18 and
-is currently unsupervised.
+Gap-fill reports B1, D2, E1 and F1 (with its addendum) are integrated below (2026-09-10 15:3x).
+Nothing in Phases 1–6 has been implemented yet. Hammerspoon was relaunched by hand at 00:20:18,
+displaced by a stray second instance at 12:03:36 (KB §F1b; two shots lost outright at 13:33), and
+relaunched again at 15:16:28 — still unsupervised.
 
 **Targets (acceptance, all measured by the bench in Phase 5 and by 7 days of real use):**
 
@@ -82,6 +84,9 @@ unit inside the 40–150K band.
 **Why.** Failure class A: SIGTERMed 2026-09-09 18:55:16 by a fleet census, dead 5.4 h, nothing
 relaunched it (KB §F1). The fleet has killed processes by pattern three times before. Measured:
 `KeepAlive=true` + `ThrottleInterval=1` respawns in 0.04–0.05 s; the default throttle makes it ~10 s.
+Second incident the same day (KB §F1b): a hand-launched second instance displaced the live one at
+12:03:36, its config aborted at `hs.ipc.cliInstall()`, and the fallback agent deferred to the
+zombie — so supervision must key on a heartbeat, and the config must survive a taken IPC port.
 
 **Design.**
 1. `launchd/org.hammerspoon.Hammerspoon.keepalive.plist` (user agent, `gui/$UID`):
@@ -94,10 +99,13 @@ relaunched it (KB §F1). The fleet has killed processes by pattern three times b
    the Login Item would start a second instance at login (KB §F8 item 3).
 3. `defaults write org.hammerspoon.Hammerspoon SUAutomaticallyUpdate -bool false` — Sparkle must not
    quit/relaunch outside launchd; updates stay manual (Hammerspoon menu).
-4. Single-instance guard in `init.lua`: at load, if another `Hammerspoon` pid exists (via
-   `hs.execute("pgrep -x Hammerspoon")` filtered by `hs.processInfo.processID`), log `second
-   instance — exiting` and `os.exit(0)` only when THIS process was NOT launched by launchd
-   (`hs.processInfo.… parent pid == 1` identifies the launchd child); the launchd instance always wins.
+4. Single-instance detection without a spawn (F1 report §15c — `hs.processInfo` has no parent-pid
+   field and a `pgrep` spawn at load is what Phase 3 removes): `local ipcOK = pcall(require, "hs.ipc")`
+   AFTER the modules have started; a failure means another instance owns the `Hammerspoon` port —
+   log it, keep the screenshot pipeline running (it does not need IPC), and surface it in `stats()`.
+   `hs.ipc.cliInstall()` is dropped: both `hs` symlinks already exist and are Homebrew's. The
+   launchd job stays the only launcher; a launchd instance never exits on this signal (KeepAlive
+   would respawn it into the same condition), it only reports.
 5. `scripts/supervise.sh {install|uninstall|status|--prove}`: `--prove` records Hammerspoon's pid,
    runs `launchctl kill TERM gui/$UID/org.hammerspoon.Hammerspoon.keepalive`, polls
    `launchctl print` for a new pid, prints `respawn N ms`, then waits for the `poll armed` line in
@@ -136,13 +144,18 @@ the PNG-only pasteboard write is 0.5 ms and is exactly what Claude Code reads (K
    `f:seek("set", size − 8)` and read 8 bytes until they equal IEND (0.17 ms) — IEND only, no
    size-stability fallback (the streaming temp plateaus between 16 KB chunks and must never be
    copied early). Cap 15 s, then one `W` line, close the handle and release.
-4. **Copy**: read the file once through the handle (3 ms for 2.4 MB),
-   `hs.pasteboard.writeAllData(nil, {["public.png"]=bytes})`, verify `changeCount` advanced and that
+4. **Copy — before any decode**: read the file once through the handle (3 ms for 2.4 MB),
+   `hs.pasteboard.writeAllData(nil, {["public.png"]=bytes})` with NO explicit `clearContents` (the
+   wrapper clears; the explicit call is a second changeCount bump that wakes pollers on an empty
+   board — D2), verify `changeCount` advanced and that
    `readDataForUTI(nil, "public.png")` returns the same byte length (a UTI merely being present is
    not verification — F1 L2), one retry; a monotonic sequence number guards the write so that when
    two shots settle in one scan the later capture ends on the clipboard (F1 L3). No TIFF: the
    pasteboard server serves TIFF readers by translation (KB §F5); `SCREENSHOT_TIFF=true` re-enables
    a second write 60 ms later for the day a consumer proves it needs one.
+   Only after the verified write does the pipeline touch `hs.image` (the thumbnail's decode is
+   ~47 ms for a 2.4 MB capture at 2×; E1 report §5) — the clipboard is usable ~50 ms earlier on big
+   captures than today's TIFF-first order.
 5. **Dedup by inode, recorded on verified copy** (`copied[ino] = {path, t}`) — never at detection
    (KB §F8 item 1). A candidate whose inode is already in `copied` or already open in a settle is a
    rename: update its current `path`, re-point the thumbnail's click target, done. Because the
@@ -184,11 +197,14 @@ entrance, replace with `hs.mouse.absolutePosition()` + `hs.screen.allScreens()` 
 per-canvas scoped callbacks, GC nudge on dismiss, pointer-display placement). Measured defect to
 fix (F1 §5.2): today `THUMB_SLIDE_DUR/THUMB_SLIDE_FPS` yields **3 frames**, the canvas is shown at
 x = screen width + 12 (fully off-screen) and the first on-screen pixel appears 83 ms after
-`show()` — a third of the visible budget. New entrance: first frame already ~70 % on-screen, then
-a 120 ms slide at 60 fps (`hs.timer` at 16 ms measured max 18 ms) — or, if E1 measures the loop as
-costlier than ~1 ms/tick, a `:show(0.12)` fade-in with no movement — and `phase=thumb-visible`
-logged at the first tick whose on-screen fraction ≥ 0.10. Build the canvas from a pre-scaled 320 px
-image. Click opens the current path for the inode (resolved at click time). Dismiss at 3 s as
+`show()` — a third of the visible budget. E1 measured the answer: **delete the slide.** Build the canvas at its final position and make
+the whole entrance `hs.canvas:show(0.12)` — a Core Animation fade on the window server, 0.02–0.05 ms
+of main thread, no timer, no globals, and it removes the state the `664d809`/`e4713ad` bugs lived in.
+`phase=thumb-visible` is emitted from `hs.canvas:isOccluded()` (F1 addendum §16: the oracle;
+`isShowing()` is not one). Pointer display from a cached screen-frame table refreshed by
+`hs.screen.watcher` (the 20 ms was the Lua wrapper, E1 §6). Do not pre-scale the image and do not
+set `wantsLayer` — both refuted by measurement. Click resolves the path by stripping the leading
+dot(s) and one inode check, never by scanning the directory (E1 §7). Click opens the current path for the inode (resolved at click time). Dismiss at 3 s as
 today. `behaviorAsLabels` adds `fullScreenAuxiliary` if the bench shows the canvas hidden over a
 fullscreen Space (unverified; KB §F8 item 10).
 
@@ -214,7 +230,13 @@ duplicated, the defect `2bf64de` fixed) · `hsc/dock.lua` (`hs.plist.read`, 9.2 
 faster than the python spawn) · `hsc/smartpaste.lua` · `hsc/screenshot/{init,watcher,settle,
 clipboard,thumbnail}.lua` (watcher and settle pure and testable) · `bench/{run.py, winprobe.swift,
 analyze.py}`. Module contract for all: `M.start(cfg)` / `M.stop()` idempotent and safe when never
-started, `M.stats()` a plain table for `hs -c` and the harness. **What the split must NOT change**:
+started, `M.stats()` a plain table for `hs -c` and the harness. **Every `require` and every
+`start()` runs under its own `pcall`, screenshot module first** (F1 addendum §15b — the 12:03
+incident proved one unguarded line takes everything down); no bare `print` (hs.ipc replaces it
+with a version that raises on a stale port — write through `hsc/log.lua`). `hsc/log.lua` keeps its
+file handle open (today's per-line open/close is measurable) and stamps `created` with the poll's
+own `absoluteTime()` at first sight, because `hs.fs` truncates every file timestamp to whole seconds
+(F1 addendum §17). **What the split must NOT change**:
 the ordering guarantees from commits `664d809`, `e4713ad`, `8e0173a`, `85b003c` (dismiss armed
 before the mouse callback, callbacks addressing their own canvas, the slide timer stopping its own
 handle, fade via `hs.canvas:hide(s)`) are ported as literal code with their comments.
@@ -255,8 +277,8 @@ compares percentiles across modes. **Log**: `hsc/log.lua` emits one logfmt line 
 `mono=` ns verbatim, `dt=` ns since `created`, bare values with `file=` always last, a closed phase
 vocabulary (`created · capture-complete · detected · settling · copied · thumb-shown · thumb-visible
 · dismissed · lost · error`), `phase=lost` emitted by a deadline timer so a loss is a positive
-record, rotation on write. The old `Ns old` field goes. **Invalidation**: a Hammerspoon pid change
-mid-run invalidates the run (its arm pass marks pending files known).
+record, rotation on write. The old `Ns old` field goes. **Invalidation**: a new `poll armed` line
+mid-run invalidates the run — a reload keeps the pid (F1 addendum §19), so the pid is not the signal.
 **Honest limits (stated in the harness output)**: `-R` reproduces the keyboard path's file writes
 byte-for-byte in sequence (F1, n = 11) but not the interactive phase, so it measures
 capture-complete → clipboard, never hotkey → clipboard; its log line reads `launched with
@@ -280,16 +302,20 @@ proven, its remaining value is negative.
 
 ## Phase 7 — Experiments (W5, optional; each one closes an open question)
 
-1. **Clipboard-destination hybrid** (devil's advocate, KB §5 B): one operator Ctrl+⌘⇧4 with a 10 ms
-   `changeCount` probe armed and the unified log open. If the clipboard path skips the `mds` call,
-   document it; the pipeline still keeps file-watch as primary because the archive file must land
-   even when Hammerspoon is down.
+1. **Clipboard-destination hybrid** (devil's advocate, KB §5 B): scriptable — `screencapture -x -c
+   -R <rect>` under the bench's pasteboard snapshot/restore with the unified log open (F1 addendum
+   §23); no operator keystroke needed. If the clipboard path skips the `mds` call, document it; the
+   pipeline still keeps file-watch as primary because the archive file must land even when
+   Hammerspoon is down. Known already: `-c` writes exactly one flavor, PNG (D2 §7).
 2. **Pasteboard watcher for Ctrl-held / ⌘⇧5 → clipboard captures**: a foreign `changeCount` bump
    carrying `public.png` with no new file within 300 ms → thumbnail from the pasteboard (KB §F8 item 5).
 3. **kqueue/dispatch-vnode helper**: only if C1's numbers show ≥ 5 ms saved at p99 over the 10 ms
    poll; otherwise closed.
-4. **Spotlight load on this box** (B1): hand the findings to claude-infrastructure; not this repo's
-   fix — the pipeline no longer depends on `mds` after Phase 2.
+4. **Spotlight load on this box** (B1, delivered): `mds` is not chronically busy; the timeouts
+   cluster after rapid CLI capture bursts (partly our own probes), and 3.06 M of the index's 15.6 M
+   documents are abandoned projects' `node_modules` under `~/Development`. Operator-side lever:
+   Spotlight Privacy exclusion of those directories (or a `.noindex` rename), filed as an operator
+   step, not this repo's fix — the pipeline no longer depends on `mds` after Phase 2.
 
 ---
 
@@ -307,6 +333,9 @@ proven, its remaining value is negative.
   introduces (hostile review item 1).
 - **PNG only.** Claude Code reads `«class PNGf»`; the pasteboard server translates for TIFF
   readers; the TIFF encode was 55 ms of a 60 ms copy. A switch keeps the door open.
+- **Clipboard before decode; no slide.** The PNG bytes need no decode, the thumbnail's decode is
+  the copy path's real cost on big captures (E1), and a `:show(0.12)` fade is a window-server
+  animation with none of the timer state that produced two shipped bugs.
 - **10 ms poll, no helper.** Measured jitter makes a kernel watcher worth ≤ 10 ms; a compiled
   dependency is not worth that until C1 shows otherwise.
 - **KeepAlive with ThrottleInterval=1, Login Item removed, Sparkle auto-update off** — the three
@@ -329,7 +358,7 @@ proven, its remaining value is negative.
 | K4 st_size invariant, 10 ms timer, inode dedup at verified copy | not run (session limits; re-run is the operator's quota call) | measured KB §F7, §F3 |
 | K5 PNG-only pasteboard suffices for Claude Code | not run (session limits; re-run is the operator's quota call) | binary evidence KB §F5 |
 | K6 SIGTERM by the census bug; nothing restarts Hammerspoon | not run (session limits; re-run is the operator's quota call) | launchd log KB §F1 |
-| gap-fill B1 / C1 / E1 / F1 | not run (session limits + capacity gate) | each has a lead-designed fallback in Phase 7.4 / 7.3 / Phase 4 / Phase 5; the bench closes E1 and C1 by measurement after landing |
+| gap-fill B1 / E1 / F1 (+addendum) / D2 | **delivered** and integrated (Phases 1, 2, 4, 5, 7) | C1 (kqueue helper) not run — the 10 ms poll stands on the measured jitter; the bench closes it by measurement after landing |
 
 ## Risks and rollbacks
 

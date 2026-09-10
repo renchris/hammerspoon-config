@@ -59,6 +59,9 @@ the file's birth time (birth = capture + ~30 ms).
   — name first; `writeObjects(object, [name])` — object first.
 - **A throwaway launchd agent** (`/bin/sleep`, label `com.hs-research.keepalive-probe`) measured
   KeepAlive semantics without touching the real jobs; it was booted out afterwards.
+- **Never execute the Hammerspoon binary directly** (`… /MacOS/Hammerspoon --version` launches a
+  second GUI instance and displaced the live one at 12:03:36 — F1b); read versions from the
+  bundle's `Info.plist`. Rapid CLI capture bursts provoke the Spotlight timeout under study (B1).
 - **Never** synthesize keyboard/mouse input while the operator is at the keyboard (HIDIdleTime was
   0.07 s during this investigation); never write the general pasteboard from a probe.
 
@@ -100,6 +103,18 @@ the file's birth time (birth = capture + ~30 ms).
   depends on fseventsd (which livelocked for a day on 2026-09-07/08), and its `*.png` glob skips
   the dotfile temp, so it always waits out Apple's stall too.
 
+- **F1b — it happened again the same day, from the inside.** At 12:03:36 a research agent ran
+  `/Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon --version` to read a build number.
+  There is no such flag: the binary ignores argv and launches a second GUI instance, which
+  registered with LaunchServices and displaced the live one; the newcomer's `init.lua` aborted at
+  line 5 because `hs.ipc.cliInstall()` could not take the already-owned `Hammerspoon` port, so the
+  whole config never loaded (F1 report §15). The fallback agent's `pgrep -xq Hammerspoon` saw a
+  Hammerspoon process and deferred to it, so the two screenshots at 13:33:12 and 13:33:20 reached
+  neither the clipboard nor a thumbnail — total loss, 100 % of that window. Relaunched by hand at
+  15:16:28. Three lessons for the plan: a process existing is not the pipeline running (heartbeat,
+  not pid); the IPC port is the cheap single-instance detector; nothing may run unguarded before
+  the modules start.
+
 ### F2 — Apple stalls up to 10 s on Spotlight AFTER the PNG is complete (latency class A)
 
 The unified log of the 23:59:59 capture (pid 85239), with the file's own timestamps:
@@ -131,6 +146,17 @@ The unified log of the 23:59:59 capture (pid 85239), with the file's own timesta
   continuous stream of CoreDuet context fetches and "Failed to resolve entitled attributes" for
   short-lived client pids. `~/.claude` (a dot-directory) is not indexed (`mdfind` count 0). Which
   processes are loading it is a fleet-side question (gap-fill axis B1; see §6).
+- **Contamination caveat (B1 report).** `mds` is not chronically busy: over a 60 s sample it ran
+  at p50 0.8 % (max 2.8 %) and `mds_stores` p50 0.7 % (max 19 %); the 20 %/36 % readings were burst
+  snapshots. All 15 `XPC_TIMEOUT` events in the retained log sat inside one 72 s span
+  (08:45:40–08:46:52) right after ~90 command-line captures in that hour — the investigation's own
+  CLI probes. Per-day file timestamps show the ≥ 1 s class on ordinary days too (08-29: 4 of 12,
+  one at 10.2 s; 08-28 p90 238 ms) but far more on investigation days (09-07/08/10), so the extreme
+  tail is real and partly self-inflicted: rapid capture bursts provoke the timeout. The design
+  removes the dependency either way, and the bench must space captures ≥ 2 s and report its stall
+  rate against the 30-day baseline. What `mds` itself waits on could not be determined without root.
+  Separately, 20.9 % of the whole Spotlight index (3.26 M of 15.6 M documents) is under
+  `~/Development`, ~94 % of it abandoned projects' `node_modules` — an operator-side exclusion lever.
 - **The image is available for the whole stall, under a hidden name.** Verified by two
   independent refuters (K2, 85 % and 88 %, 0.5 ms hashing pollers, n = 4 + 6 CLI lifecycles, the
   binary's single `CGImageDestinationCreateWithURL` call site, and 18 joined keyboard shots): one
@@ -180,6 +206,14 @@ Every real keyboard screenshot since the poll landed on 2026-09-08 (n = 20), ms:
   (max 112 ms when two shots landed together). `detected→copied` scales with image size: the PNG
   read and decode are ~1 ms, the **TIFF re-encode is 55 ms for 2516×1926** (19.4 MB TIFF) versus
   0.5 ms for the PNG-only pasteboard write (measured in-process on a private pasteboard).
+- **Where the copy time really goes (E1 report, measured at the display's 2× backing scale):**
+  `imageFromPath` is lazy (0.4–0.9 ms); the real cost is the first render — PNG decode ~1 ms for
+  the 46 KB capture and **~47 ms for the 2.4 MB one**, plus ~3 ms for the rounded-rect chrome and
+  shadow. Today the TIFF step pays that decode first (50 ms) and the thumbnail then renders in 24 ms;
+  drop TIFF alone and the thumbnail pays 68 ms instead — the combined path shrinks by only ~5.6 ms.
+  **Writing the pasteboard before any decode is what moves the clipboard ~50 ms earlier** on a big
+  capture: the PNG bytes need no decode at all. `hs.mouse.getCurrentScreen()` costs 20 ms because of
+  the Lua wrapper (1+N `allScreens()` calls, 3N geometry objects); the OS calls are 0.000 ms.
 - Then the thumbnail: a 250 ms slide-in at 15 fps (timer loop), so the user sees it settle
   ~300 ms after the copy; the Pop sound is played before the canvas is built.
 - The poll's cost: `stat()` 60 µs; listing 3,374 entries 7.0 ms; `hs.timer` jitter under load 22:
@@ -200,6 +234,10 @@ Every real keyboard screenshot since the poll landed on 2026-09-08 (n = 20), ms:
 - The settle loop reads the whole PNG every 50 ms while waiting (`f:read("*a")`, up to 3 MB); a
   tail-8-byte IEND check is microseconds.
 - `hs.image.imageFromPath` is lazy (0.5–0.9 ms); decoding happens when the canvas renders.
+- `hs.ipc.cliInstall()` is the unguarded first statement of `init.lua`; when the `Hammerspoon` port
+  is already owned it raises and the entire config aborts (F1b). `hs.ipc` also replaces the global
+  `print`, whose replacement raises once a CLI instance's port goes stale. `shotlog` opens, writes
+  and closes the log per line on the main thread (F1 report §23).
 
 ### F5 — What Claude Code needs from the pasteboard (correctness)
 
@@ -212,7 +250,15 @@ as «class furl»`; text with `pbpaste` (2 s timeout); large images are byte-bud
 TIFF is never asked for. The pasteboard server also advertises translations of a PNG-only write
 (`clipboard info` after the fallback's PNG-only osascript listed PNGf, 8BPS, GIF, jp2, JPEG, TIFF,
 BMP, TPIC), so legacy TIFF readers are served without us encoding one. Claude Code's own read costs
-two `osascript` spawns after ⌃V — outside this repo's control.
+two `osascript` spawns after ⌃V — outside this repo's control. The D2 report confirmed it from a
+separate AppKit process: a pasteboard holding only `public.png` advertises `public.png`, `Apple PNG
+pasteboard type`, `public.tiff` and `NeXT TIFF v4.0 pasteboard type`, and `data(forType: .tiff)`
+returns a valid 19.4 MB TIFF synthesised on demand — even after the writer has exited. Mail, Notes,
+Messages, Chrome/Discord/Cursor, Figma and Preview all read board-level. `init.lua:446`'s explicit
+`clearContents()` is redundant (the wrapper clears itself), so every screenshot bumps `changeCount`
+twice and pollers wake once on an empty board. `screencapture -c` writes exactly one flavor, PNG.
+Residual: an item-level `NSPasteboardItem.data(forType: .tiff)` reader would not get the synthesis;
+none is known here.
 
 ### F6 — Supervision semantics (measured with a throwaway agent)
 
@@ -245,7 +291,10 @@ still exists — both can launch a second instance outside launchd (hostile revi
 | utime / overwrite in place | same | same | same |
 
 The inode is stable across the rename (`889053410 → 889053410`); `hs.fs.attributes` exposes `ino`
-and `creation` (birth time) besides the whole-second `modification`/`change`. So **creation is
+and `creation` (birth time) — **all four timestamps truncated to whole seconds** (F1 report §17:
+python reads 1789059550.804981, Hammerspoon reads 1789059550), so in-process timing must come from
+the poll's own `hs.timer.absoluteTime()`, never from file attributes. APFS did not recycle any inode
+across 60 create/delete cycles, so bench cleanup cannot collide with a live dedup entry (§18). So **creation is
 always visible in st_size** (no dependence on second-resolution timestamps), and only the rename is
 invisible to the size — which the redesign makes non-critical (it re-points a path).
 
@@ -283,7 +332,11 @@ means the clipboard path skips the stall entirely. 14 days of logs contain zero 
 | claim | mechanism lens | measurement lens | outcome |
 |---|---|---|---|
 | K2 hidden temp, same inode, bytes final before the stall | stands, 85 % | stands, 88 % | corrections adopted above (three-name lifecycle; miss-not-corruption race; fd-open remedy; gain qualified) |
-| K1 mds XPC timeout after the PNG is complete | not run (session limit) | not run | primary evidence §F2; K2's refuters independently re-derived the mds/mdwrite/rename sequence and the 30-day distribution (n = 607: p50 11 ms, p90 221 ms, p99 9.95 s) |
+| K1 mds XPC timeout after the PNG is complete | re-run in flight (third attempt) | re-run in flight | primary evidence §F2; K2's refuters independently re-derived the mds/mdwrite/rename sequence and the 30-day distribution (n = 607: p50 11 ms, p90 221 ms, p99 9.95 s); B1 adds the contamination caveat |
+| gap-fill B1 Spotlight load | delivered (28 KB) | — | mds not chronically busy; timeouts cluster after CLI bursts; index composition lever |
+| gap-fill D2 pasteboard strategy | delivered (25 KB) | — | PNG-only, one call, no explicit clear; TIFF synthesised for readers |
+| gap-fill E1 thumbnail | delivered (31 KB) | — | `:show(0.12)` entrance, clipboard before decode, cached screen frames |
+| gap-fill F1 module split + bench | delivered (51 KB + 28 KB addendum) | — | package.path bootstrap, dead reload guard, pcall per module, `isOccluded()` oracle, whole-second hs.fs timestamps |
 | K3 KeepAlive / ThrottleInterval / TCC / double launch | not run | not run | measured §F6 |
 | K4 st_size invariant, 10 ms timer, inode dedup at verified copy | not run | not run | measured §F7, §F3; K2's refuters confirmed inode stability across all three names |
 | K5 PNG-only pasteboard suffices for Claude Code | not run | not run | binary evidence §F5 |
@@ -328,7 +381,8 @@ collected in this session, and the plan's bench (Phase 5) re-measures each one a
 | question | why it matters | cheapest closing action |
 |---|---|---|
 | Exact temp-name spelling on the keyboard path (three names: `..Screenshot X.png-XXXX` → `.Screenshot X.png` → final; observed live July 2026, inferred from the binary's single writer this session) | the matcher must not depend on it | match any new regular file by PNG signature + creation time and hold its file handle across the renames (design choice); confirm once from the 10 ms poll's own log after landing |
-| Does the clipboard destination (`-c` / Ctrl-held) skip the mds call? | decides whether option B beats A on latency | the one-shot experiment in §F8, when the operator is present |
+| Does the clipboard destination (`-c` / Ctrl-held) skip the mds call? | decides whether option B beats A on latency | scriptable: `screencapture -x -c -R <rect>` under a pasteboard snapshot/restore, unified log open (F1 report §23) — no operator needed |
+| Spotlight index: 3.06 M of 15.6 M documents are abandoned projects' `node_modules` under `~/Development` | shrinks the indexer's standing work; operator-side | add those directories (or `~/Development` minus the active repos) to Spotlight Privacy; B1 report §6 |
 | What loads `mds` on this box? | fleet-wide cost; Finder/Spotlight suffer too | gap-fill axis B1 (pending); hand to claude-infrastructure |
 | Any consumer that needs `public.tiff`? | PNG-only is the fast path | pasteboard translations cover TIFF readers (§F5); keep a one-line switch to add TIFF |
 | kqueue helper vs 10 ms poll | ≤ 10 ms | gap-fill axis C1 (pending) |
