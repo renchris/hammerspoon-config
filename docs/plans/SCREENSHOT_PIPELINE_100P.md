@@ -12,8 +12,9 @@ bottom-right thumbnail pipeline to 100.00 % reliability and 100th-percentile lat
 quality, on the basis of the measured knowledge base `docs/research/screenshot-pipeline-2026-09-10.md`.
 This document is the implementation plan; its waves are executed as dispatched sessions (Phase 0).
 
-**Status:** plan written 2026-09-10 08:45 CDT; verification wave (K1–K6) and gap-fill axes
-(B1, C1, E1, F1) in flight — their results are integrated in § Verification ledger as they land.
+**Status:** plan written 2026-09-10 08:45 CDT; K2 verified by two independent refuters at 11:4x
+(corrections adopted in Phase 2); the remaining verifications and gap-fill axes died twice on
+5-hour session limits and are named in § Verification ledger, not bridged.
 Nothing in Phases 1–6 has been implemented yet. Hammerspoon was relaunched by hand at 00:20:18 and
 is currently unsupervised.
 
@@ -122,22 +123,28 @@ the PNG-only pasteboard write is 0.5 ms and is exactly what Claude Code reads (K
    `hs.fs.attributes(dir)`; the signature is `size` alone (plus `mtime`/`ctime` for the
    rename-only case, used below). On a size change → `scan()`. No "hot second" rescans.
 2. **Scan**: list the directory; for every name not in `seen` (a table of names) → `seen[name]=true`;
-   candidate iff `hs.fs.attributes(path)` is a regular file with `creation ≥ now − 30 s`, size > 8,
-   and its first 8 bytes are the PNG signature `\137PNG\r\n\26\n` (read via `io.open` + `read(8)`).
-   Name spelling — dotfile, final, `hs-bench-…`, a Finder copy — is irrelevant; the 30 s creation
-   window excludes Finder duplicates of old shots and sync-client churn (KB §F8 item 7).
-3. **Settle** per candidate, every 10 ms, until `tail-8 == IEND` (0.17 ms read) — IEND only, no
-   size-stability fallback (a dotfile whose write plateaus must never be copied). Cap 15 s, then
-   one `W` line and release.
+   candidate iff `hs.fs.attributes(path)` is a regular file with `creation ≥ now − 30 s`. **Open the
+   file handle immediately and keep it** — Apple renames the same inode twice
+   (`..Screenshot X.png-XXXX` streaming temp → `.Screenshot X.png` complete → final name, KB §F2)
+   and a handle survives both, so every later check reads through the handle and never through a
+   path. Once ≥ 8 bytes exist, the first 8 must be the PNG signature `\137PNG\r\n\26\n`, else the
+   candidate is dropped. Name spelling — either hidden form, final, `hs-bench-…`, a Finder copy —
+   is irrelevant; the 30 s creation window excludes Finder duplicates of old shots and sync-client
+   churn (KB §F8 item 7).
+3. **Settle** per candidate, every 10 ms, through the open handle: `size = f:seek("end")`, then
+   `f:seek("set", size − 8)` and read 8 bytes until they equal IEND (0.17 ms) — IEND only, no
+   size-stability fallback (the streaming temp plateaus between 16 KB chunks and must never be
+   copied early). Cap 15 s, then one `W` line, close the handle and release.
 4. **Copy**: read the file once (3 ms for 2.4 MB), `hs.pasteboard.writeAllData(nil, {["public.png"]=bytes})`,
    verify `changeCount` advanced and `contentTypes` contains `public.png` (one retry). No TIFF: the
    pasteboard server serves TIFF readers by translation (KB §F5); `SCREENSHOT_TIFF=true` re-enables
    a second write 60 ms later for the day a consumer proves it needs one.
 5. **Dedup by inode, recorded on verified copy** (`copied[ino] = {path, t}`) — never at detection
-   (KB §F8 item 1). A candidate whose inode is already in `copied` is a rename: update `path`,
-   re-point the thumbnail's click target, done. A settle that finds its path gone re-resolves the
-   inode by listing the directory once; if found under a new name it continues there; if the inode
-   is gone the shot was deleted before completion (log `gone`).
+   (KB §F8 item 1). A candidate whose inode is already in `copied` or already open in a settle is a
+   rename: update its current `path`, re-point the thumbnail's click target, done. Because the
+   settle reads through the handle, a rename between polls costs nothing; the path is re-resolved by
+   inode only when it is needed (thumbnail click, `renamed` log line). A handle whose inode has no
+   directory entry left was deleted before completion (log `gone`, close it).
 6. **Thumbnail + sound** after the verified copy (Phase 4); Pop is played AFTER the canvas shows.
 7. **Arm**: mark all existing names `seen`, but any entry created within the last 15 s that has no
    `copied` record in the log is treated as new (bounded retroactivity — covers the KeepAlive
@@ -253,13 +260,13 @@ proven, its remaining value is negative.
 
 | claim | verifier verdicts | status |
 |---|---|---|
-| K1 mds XPC timeout after the PNG is complete | pending | primary evidence in KB §F2 |
-| K2 dotfile temp, same inode, bytes final at mtime | pending | design made spelling-independent regardless |
-| K3 KeepAlive/ThrottleInterval/TCC/double-launch | pending | measured KB §F6 |
-| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | pending | measured KB §F7, §F3 |
-| K5 PNG-only pasteboard suffices for Claude Code | pending | binary evidence KB §F5 |
-| K6 SIGTERM by the census bug; nothing restarts Hammerspoon | pending | launchd log KB §F1 |
-| gap-fill B1 / C1 / E1 / F1 | pending | Phase 7.4 / 7.3 / Phase 4 / Phase 5 respectively |
+| K1 mds XPC timeout after the PNG is complete | not run (two workflow runs died on session limits) | primary evidence in KB §F2; K2's refuters independently re-derived the mds → mdwrite → rename sequence |
+| K2 hidden temp, same inode, bytes final at mtime | **stands** — mechanism 85 %, measurement 88 % (two independent refuters, 0.5 ms hashing pollers, binary call-site analysis, 18 joined keyboard shots) | corrections adopted: three-name lifecycle (`..X.png-XXXX` → `.X.png` → final), the race is a MISS not a wrong image, fd-open remedy in Phase 2 steps 2–5, gain qualified (median 5–10 ms; ≥ 1 s in 4.6 %; 10 s in 1 %) |
+| K3 KeepAlive/ThrottleInterval/TCC/double-launch | not run (session limits; re-run is the operator's quota call) | measured KB §F6 |
+| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | not run (session limits; re-run is the operator's quota call) | measured KB §F7, §F3 |
+| K5 PNG-only pasteboard suffices for Claude Code | not run (session limits; re-run is the operator's quota call) | binary evidence KB §F5 |
+| K6 SIGTERM by the census bug; nothing restarts Hammerspoon | not run (session limits; re-run is the operator's quota call) | launchd log KB §F1 |
+| gap-fill B1 / C1 / E1 / F1 | not run (session limits + capacity gate) | each has a lead-designed fallback in Phase 7.4 / 7.3 / Phase 4 / Phase 5; the bench closes E1 and C1 by measurement after landing |
 
 ## Risks and rollbacks
 

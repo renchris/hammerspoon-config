@@ -131,11 +131,22 @@ The unified log of the 23:59:59 capture (pid 85239), with the file's own timesta
   continuous stream of CoreDuet context fetches and "Failed to resolve entitled attributes" for
   short-lived client pids. `~/.claude` (a dot-directory) is not indexed (`mdfind` count 0). Which
   processes are loading it is a fleet-side question (gap-fill axis B1; see §6).
-- **The image is available 10 s before the rename.** During the stall the complete PNG sits in
-  `~/Screenshots` under its hidden temp name (`.Screenshot … .png`; the CLI equivalent measured
-  as `.life.png` → `life.png`, same inode, 25 ms apart when mds was fast). The current matcher
-  (`^Screenshot…png$`) ignores dotfiles, so the pipeline waits for Apple. 0 stranded dotfiles exist
-  among 3,374 entries, so the rename always eventually lands.
+- **The image is available for the whole stall, under a hidden name.** Verified by two
+  independent refuters (K2, 85 % and 88 %, 0.5 ms hashing pollers, n = 4 + 6 CLI lifecycles, the
+  binary's single `CGImageDestinationCreateWithURL` call site, and 18 joined keyboard shots): one
+  code path serves the keyboard and the CLI. ImageIO streams the PNG into
+  `<dir>/..<name>.png-XXXX` (partial, no IEND at any of 50 observed intermediate sizes), then
+  atomically renames it to `<dir>/.<name>.png` — **already complete at its first appearance**
+  (same inode, same sha256, mtime fixed) — then screencapture calls `MDItemCreate`/`SetAttributes`
+  (the `mds` XPC that can stall 10 s) and only afterwards renames it to `<name>.png`. The current
+  matcher (`^Screenshot…png$`) ignores both hidden names, so the pipeline waits for Apple. The gain
+  from reading the hidden file equals the rename delay: median 5–10 ms, ≥ 1 s in 4.6 % of shots,
+  ~10 s in the 1 % that hit the timeout. The single-dot file is visible for ≥ 50 ms in only 18 % of
+  shots (median 11 ms), so a **path-based** reader can hit ENOENT between two polls — a miss, never
+  a wrong image. The remedy is to open the file handle once at detection (a handle survives both
+  renames) and re-resolve by inode on ENOENT. Keyboard-path temp spelling was observed live in
+  July 2026 (commit `8e0173a`) and follows from the shared call site; no keyboard shot occurred
+  during this session's watch windows. 0 stranded hidden files exist among 3,374 entries.
 
 ### F3 — Hammerspoon's own path after the rename (latency class B)
 
@@ -267,6 +278,22 @@ experiment that decides it: one Ctrl+⌘⇧4 with a 10 ms changeCount probe arme
 open — no `com.apple.metadata.mds` line and a changeCount bump ~100 ms after `Capturing image`
 means the clipboard path skips the stall entirely. 14 days of logs contain zero clipboard-mode runs.
 
+### F9 — Verification wave status (adversarial refuters, two lenses per claim)
+
+| claim | mechanism lens | measurement lens | outcome |
+|---|---|---|---|
+| K2 hidden temp, same inode, bytes final before the stall | stands, 85 % | stands, 88 % | corrections adopted above (three-name lifecycle; miss-not-corruption race; fd-open remedy; gain qualified) |
+| K1 mds XPC timeout after the PNG is complete | not run (session limit) | not run | primary evidence §F2; K2's refuters independently re-derived the mds/mdwrite/rename sequence and the 30-day distribution (n = 607: p50 11 ms, p90 221 ms, p99 9.95 s) |
+| K3 KeepAlive / ThrottleInterval / TCC / double launch | not run | not run | measured §F6 |
+| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | not run | not run | measured §F7, §F3; K2's refuters confirmed inode stability across all three names |
+| K5 PNG-only pasteboard suffices for Claude Code | not run | not run | binary evidence §F5 |
+| K6 SIGTERM by the census bug; nothing restarts Hammerspoon | not run | not run | launchd log §F1 |
+
+Two workflow runs (17 slots each) and three bare research agents died on 5-hour session limits
+(resets 02:30 and 11:40 CDT); the recovery ledger is `~/.reso/limit-recover/<session>/`. The
+unrun refutations are named gaps, not bridged: every claim above rests on primary evidence
+collected in this session, and the plan's bench (Phase 5) re-measures each one after landing.
+
 ## 4. Failure-mode catalogue (every way a shot fails today, and its status)
 
 | # | failure | today | after the plan |
@@ -300,7 +327,7 @@ means the clipboard path skips the stall entirely. 14 days of logs contain zero 
 
 | question | why it matters | cheapest closing action |
 |---|---|---|
-| Exact temp-name spelling on the keyboard path (`.Screenshot … .png` observed 2026-09-08; CLI shows `.name.png`) | the matcher must not depend on it | match any new regular file by PNG signature + creation time, not by name spelling (design choice); confirm once from the 10 ms poll's own log after landing |
+| Exact temp-name spelling on the keyboard path (three names: `..Screenshot X.png-XXXX` → `.Screenshot X.png` → final; observed live July 2026, inferred from the binary's single writer this session) | the matcher must not depend on it | match any new regular file by PNG signature + creation time and hold its file handle across the renames (design choice); confirm once from the 10 ms poll's own log after landing |
 | Does the clipboard destination (`-c` / Ctrl-held) skip the mds call? | decides whether option B beats A on latency | the one-shot experiment in §F8, when the operator is present |
 | What loads `mds` on this box? | fleet-wide cost; Finder/Spotlight suffer too | gap-fill axis B1 (pending); hand to claude-infrastructure |
 | Any consumer that needs `public.tiff`? | PNG-only is the fast path | pasteboard translations cover TIFF readers (§F5); keep a one-line switch to add TIFF |
