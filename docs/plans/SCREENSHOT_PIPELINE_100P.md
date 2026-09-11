@@ -123,15 +123,31 @@ bench's thumbnail appears); TCC unchanged (same signed bundle, KB §F6).
 
 ## Phase 2 — Detection and copy: the dotfile is the file (W1)
 
-**Why.** Failure class A/latency class A: Apple blocks up to 10 s on Spotlight AFTER the PNG is
-complete; the matcher waits for the rename (KB §F2). Measured: 10 ms `hs.timer` is stable (p99
-11.0 ms); creation always changes the directory's st_size by 32 B; the inode survives the rename;
-the PNG-only pasteboard write is 0.5 ms and is exactly what Claude Code reads (KB §F5, §F7).
+**Why.** Failure class A/latency class A: Apple blocks on Spotlight AFTER the PNG is complete —
+**unboundedly, not for 10 s** (K1 refuters: 13.7 s and 29.4 s observed) — and the matcher waits for
+the rename (KB §F2). Measured: 10 ms `hs.timer` is stable (p99 11.0 ms); creation always changes the
+directory's st_size by 32 B; the inode survives the rename; the PNG-only pasteboard write is 0.5 ms
+and is exactly what Claude Code reads (KB §F5, §F7).
+
+**And there is a live defect this phase closes, independent of the stall (C1, KB §F7, failure mode
+14).** The shipped poll keys on `mtime:ctime:size` at whole-second granularity, so a final rename
+landing in the last ~30 ms of a wall-clock second changes *nothing* it looks at, and `HOT_EVERY`
+covers only the remainder of that second — detection is then deferred until the next screenshot,
+which is unbounded. Measured exposure at the shipped 50 ms poll: **11/20 offsets deferred or lost in
+a phase-locked sweep, ~3 % of shots**, with one production instance already on disk (**6 026 ms**,
+its ctime fractional second 0.987). If this phase slips, land step 1's signature change on its own
+first — it is one line and it closes the defect.
 
 **Design (`screenshot.lua`, ~350 lines).**
 1. **Poll**: `hs.timer.new(0.010, tick, true)` (continueOnError). `tick` does one
-   `hs.fs.attributes(dir)`; the signature is `size` alone (plus `mtime`/`ctime` for the
-   rename-only case, used below). On a size change → `scan()`. No "hot second" rescans.
+   `hs.fs.attributes(dir)`; the signature is **`size` alone — no `mtime`/`ctime` term at all**. On a
+   size change → `scan()`. No "hot second" rescans. **(C1, adopted: a size-only signature
+   deliberately ignores renames, which is correct precisely because this design no longer depends on
+   them — it triggers on creation, and a creation always moves st_size. Adding mtime/ctime back is
+   what re-opens failure mode 14, because at whole-second granularity they are identical across a
+   same-second rename. Measured with size-only: first-name detection p50 4.705 / p90 10.011 /
+   p99 11.050 ms, 35/35 caught; and the poll's main-thread cost falls from 23.35 directory listings
+   per shot to 1.00 — a bigger win than the rejected kqueue helper's 4 ms, at zero cost.)**
 2. **Scan**: list the directory; for every name not in `seen` (a table of names) → `seen[name]=true`;
    candidate iff `hs.fs.attributes(path)` is a regular file with `creation ≥ now − 30 s`. **Open the
    file handle immediately and keep it** — Apple renames the same inode twice
@@ -315,8 +331,17 @@ proven, its remaining value is negative.
    Hammerspoon is down. Known already: `-c` writes exactly one flavor, PNG (D2 §7).
 2. **Pasteboard watcher for Ctrl-held / ⌘⇧5 → clipboard captures**: a foreign `changeCount` bump
    carrying `public.png` with no new file within 300 ms → thumbnail from the pasteboard (KB §F8 item 5).
-3. **kqueue/dispatch-vnode helper**: only if C1's numbers show ≥ 5 ms saved at p99 over the 10 ms
-   poll; otherwise closed.
+3. ~~**kqueue/dispatch-vnode helper**~~ — **CLOSED by C1 (delivered), do not re-open speculatively.**
+   The bar was ≥ 5 ms saved at p99; measured saving is **~4 ms at p50 and ~7 ms at p99** (helper
+   p50 0.503 / p99 4.224 ms vs the size-only 10 ms poll's p50 4.705 / p99 11.050 ms, n=35 each,
+   through the real `hs.task` streaming path). Rejected: that 4 ms sits on a path already carrying
+   Apple's 16 ms PNG write and a 250 ms slide-in, and it is bought with a blind spot the poll does
+   not have (**directory replacement ⇒ the watcher goes permanently deaf**, C1 FM2), a second
+   unsupervised process on a box where the first one died twice in one day, and a compiled artifact
+   to keep building. **Re-open only if** the final-name rename becomes load-bearing again — then
+   `NOTE_RENAME` + `F_GETPATH` on a held fd is genuinely better than anything a poll can do, the
+   prototype is at `…/scratchpad/c1-work/bin/kqwatch` with the `hs.task` integration in C1 §9, and
+   C1's FM2/FM3 (re-open on directory replacement) are mandatory before it ships.
 4. **Spotlight load on this box** (B1, delivered): `mds` is not chronically busy; the timeouts
    cluster after rapid CLI capture bursts (partly our own probes), and 3.06 M of the index's 15.6 M
    documents are abandoned projects' `node_modules` under `~/Development`. Operator-side lever:
@@ -342,8 +367,19 @@ proven, its remaining value is negative.
 - **Clipboard before decode; no slide.** The PNG bytes need no decode, the thumbnail's decode is
   the copy path's real cost on big captures (E1), and a `:show(0.12)` fade is a window-server
   animation with none of the timer state that produced two shipped bugs.
-- **10 ms poll, no helper.** Measured jitter makes a kernel watcher worth ≤ 10 ms; a compiled
-  dependency is not worth that until C1 shows otherwise.
+- **10 ms poll, no helper — settled by measurement, not by preference (C1, 88 % conviction).** A
+  kernel watcher is genuinely faster (p50 0.503 / p99 4.224 ms vs 4.705 / 11.050 ms) but the whole
+  prize is ~4 ms p50 / ~7 ms p99 against a 16 ms Apple write and a 250 ms slide-in, and it costs a
+  permanent-deafness failure mode on directory replacement plus a second unsupervised process. The
+  residual 12 % is C1 §12: no real ⌘⇧4 keyboard shot occurred inside a watch window (the lifecycle
+  was a faithful reproduction of KB §F2, not Apple's own bytes), and the main-thread contention that
+  most threatens the poll was measured on a proxy rather than on a busy Hammerspoon — both close in
+  the Phase 5 bench.
+- **The poll's signature is `st_size` alone.** This is the one-line change C1 rates the
+  highest-value line in its axis: it closes a live blind spot (failure mode 14 — ~3 % of shots at
+  the shipped 50 ms poll, one production instance at 6 026 ms) *and* drops main-thread cost from
+  23.35 listings per shot to 1.00. Safe only in combination with triggering on creation rather than
+  on the final name — which is exactly what Phase 2 does.
 - **KeepAlive with ThrottleInterval=1, Login Item removed, Sparkle auto-update off** — the three
   together are what "exactly one instance, back in under a second" requires.
 - **Bounded retroactivity (15 s at arm)** replaces "never retroactive": the 2026-09-08 rationale
@@ -361,10 +397,11 @@ proven, its remaining value is negative.
 | K1 mds XPC timeout after the PNG is complete | **stands, 80 %** (mechanism); measurement lens not run (cap) | blocking call is MDItemSetAttributes; the stall is unbounded (13.7 s, 29.4 s seen) — no 10 s assumption anywhere (Phase 2 cap 30 s; Phase 6) |
 | K2 hidden temp, same inode, bytes final at mtime | **stands** — mechanism 85 %, measurement 88 % (two independent refuters, 0.5 ms hashing pollers, binary call-site analysis, 18 joined keyboard shots) | corrections adopted: three-name lifecycle (`..X.png-XXXX` → `.X.png` → final), the race is a MISS not a wrong image, fd-open remedy in Phase 2 steps 2–5, gain qualified (median 5–10 ms; ≥ 1 s in 4.6 %; 10 s in 1 %) |
 | K3 KeepAlive/ThrottleInterval/TCC/double-launch | **refuted 85 % / 80 %** — KeepAlive respawns a mature job in ~1 ms at the DEFAULT throttle; TI=1 only shortens crash-loop backoff | Phase 1 keeps the default ThrottleInterval; downtime bound is Hammerspoon's own start (~0.6–2 s) |
-| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | **refuted 90 % / 88 %** — size detects a count change once, a listing races the renames (~5 % of shots) | Phase 2 scan re-lists until inode count == size/32 − 2 and opens each new inode by its current name |
+| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | **refuted 90 % / 90 %** — the invariant holds and sharpens (size = 32 × (entries + 2), moving only with the NET entry count, name-length independent), but it detects a count change ONCE and a 7 ms listing races Apple's two renames (~5 % of shots) | Phase 2 scan re-lists until inode count == size/32 − 2 and opens each new inode by its current name |
 | K5 PNG-only pasteboard suffices for Claude Code | **stands 88 % / 85 %** | Claude Code's native module asks for public.png first; osascript PNGf is its fallback |
 | K6 SIGTERM by the census bug; nothing restarts Hammerspoon | cause **stands 85 %**; three details corrected (one ~2 s pass, 76 kills; 875/878 was the next-day reproduction) | KB §F1/§F9 |
-| gap-fill B1 / E1 / F1 (+addendum) / D2 | **delivered** and integrated (Phases 1, 2, 4, 5, 7) | C1 (kqueue helper) not run — the 10 ms poll stands on the measured jitter; the bench closes it by measurement after landing |
+| gap-fill B1 / E1 / F1 (+addendum) / D2 | **delivered** and integrated (Phases 1, 2, 4, 5, 7) | — |
+| gap-fill C1 (kqueue helper vs the poll) | **delivered** (32 KB, conviction 88 %) and integrated (Phase 2 step 1, Phase 7 item 3, decision log) | Helper **rejected on its own numbers** (~4 ms p50 / ~7 ms p99 saved, for a permanent-deafness failure mode + a second unsupervised process). The axis's real yield is the opposite finding: the **shipped** `mtime:ctime:size` signature has a structural blind spot — ~3 % of shots at the 50 ms poll, one production instance at 6 026 ms (KB §F7, failure mode 14) — closed by the one-line `st_size`-only signature |
 
 ## Risks and rollbacks
 
@@ -383,3 +420,12 @@ proven, its remaining value is negative.
 2. Clipboard destination skips `mds`? — W5 experiment 1 (operator presses Ctrl+⌘⇧4 once).
 3. `fullScreenAuxiliary` over fullscreen Spaces — W3 bench.
 4. What loads `mds` — B1 (pending), then claude-infrastructure.
+5. **Does `screencapture` post a Darwin notification?** — would beat both the poll and the rejected
+   helper at zero cost. Cheapest close (C1 §12): `notifyutil -w` on candidate names while one shot is
+   taken. Untested; nobody has looked.
+6. **Population miss-rate of the current signature** — C1's ~1.5 % (10 ms) / ~3 % (50 ms) is modelled
+   from n=190 synthetic cycles against n=1 production instance. After the `st_size`-only signature
+   lands, the poll's own log makes it directly countable (W3 bench).
+7. **`hs.reload()` toward a running `hs.task` child** — untested (reload was forbidden during C1);
+   matters only if the helper is ever revived, but an orphaned child would accumulate silently.
+   Close by reading Hammerspoon's `libtask.m` teardown, or one operator-run reload probe.

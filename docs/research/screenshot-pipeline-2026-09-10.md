@@ -298,6 +298,41 @@ across 60 create/delete cycles, so bench cleanup cannot collide with a live dedu
 always visible in st_size** (no dependence on second-resolution timestamps), and only the rename is
 invisible to the size — which the redesign makes non-critical (it re-points a path).
 
+**But the SHIPPED poll does not key on st_size, and that is a live blind spot (C1, 2026-09-10,
+measured).** `init.lua:613` keys on the composite signature `mtime:ctime:size`, and the table above
+is exactly why that is unsafe: a same-directory rename changes mtime and ctime but — at the
+whole-second granularity `hs.fs.attributes` exposes — leaves the composite *identical* whenever the
+rename lands in the same wall-clock second as the create, while never touching st_size. The
+`HOT_EVERY` rescue at `init.lua:618` fires only while `a.modification >= os.time()`, i.e. only for
+the remainder of that same second. **A rename in the last tens of ms of a second is therefore
+invisible, and stays invisible until st_size next changes — in production, until the next
+screenshot, which is unbounded.**
+
+Phase-locked sweep of the final rename across the second boundary (n=20 offsets, all observers
+concurrent): **kqueue 0/20 deferred-or-lost; the 10 ms poll 5/20; the 50 ms poll 11/20.** Hole width
+≈ **15 ms/second at 10 ms, ≈ 30 ms/second at 50 ms** — bounded above by one hot-rescan period
+(2 × interval) **[reasoned]**; the tick phase drifts, so the *width* is the stable quantity, not the
+position. That is ~1.5 % of shots at 10 ms and ~3 % at the **shipped 50 ms**, matching the observed
+synthetic rates (1/40 at 10 ms; 3/40 and 3/150 at 50 ms).
+
+**It is already in production.** Joining every final-named screenshot in `~/Screenshots` against
+every `detected` line in `~/Library/Logs/Hammerspoon/screenshot.log` since the poll landed
+(n = 27 joinable): p50 33 ms, p90 96 ms, **p99 = max = 6 026 ms**. The one outlier is
+`Screenshot 2026-09-10 at 8.42.30 AM.png`, whose ctime fractional second is **0.987** — inside the
+hole. One instance is not a rate, but the fractional-second signature makes the mechanism, not
+chance, the explanation.
+
+**The fix is one line of Lua, not a binary: key the signature on `st_size` alone and delete
+`HOT_EVERY`.** It is hole-free *in combination with* triggering on creation rather than on the final
+name (the Phase 2 dotfile design), because a creation always changes st_size — a size-only signature
+deliberately ignores renames, which is correct precisely because the design no longer depends on
+them. It also drops the poll's main-thread cost from **23.35 directory listings per shot to 1.00**.
+Measured with that signature: first-name detection p50 4.705 / p90 10.011 / p99 11.050 ms, **35/35
+caught** (C1 §5, §9). Residual, resolved against the helper too: a poll of interval `T` catches the
+hidden name with probability `min(1, D/T)`, so the expected loss versus a perfect watcher peaks at
+`T/4` = 2.5 ms at 10 ms **[reasoned]** — and the shots where the dotfile copy actually pays
+(§F2: 4.6 % ≥ 1 s, 1.1 % ≈ 10 s) have `D ≫ T` and are caught with probability 1.
+
 ### F8 — Adversarial review of the redesign (two frontier-tier reports, verbatim in the scratchpad)
 
 Hostile reviewer, ranked: (1) copying from the dotfile adds one new silent-loss race — the rename
@@ -332,15 +367,16 @@ means the clipboard path skips the stall entirely. 14 days of logs contain zero 
 | claim | mechanism lens | measurement lens | outcome |
 |---|---|---|---|
 | K2 hidden temp, same inode, bytes final before the stall | stands, 85 % | stands, 88 % | corrections adopted above (three-name lifecycle; miss-not-corruption race; fd-open remedy; gain qualified) |
-| K1 mds XPC timeout after the PNG is complete | re-run in flight (third attempt) | re-run in flight | primary evidence §F2; K2's refuters independently re-derived the mds/mdwrite/rename sequence and the 30-day distribution (n = 607: p50 11 ms, p90 221 ms, p99 9.95 s); B1 adds the contamination caveat |
+| K1 mds XPC timeout after the PNG is complete | **stands, 80 %** | re-run in flight (fourth attempt) | sequence confirmed; four rewordings adopted — the blocking call is **`MDItemSetAttributes`** (screencapture's only Metadata imports are `MDItemCreate`, `MDItemSetAttributes`, `_MDItemMarkAsUsedWithURL`), and **the stall is unbounded, not a 10 s timeout**: 13.7 s and 29.4 s observed, so no 10 s assumption survives anywhere in the design (Phase 2 caps at 30 s). Primary evidence §F2; K2's refuters independently re-derived the mds/mdwrite/rename sequence and the 30-day distribution (n = 607: p50 11 ms, p90 221 ms, p99 9.95 s); B1 adds the contamination caveat |
 | gap-fill B1 Spotlight load | delivered (28 KB) | — | mds not chronically busy; timeouts cluster after CLI bursts; index composition lever |
 | gap-fill D2 pasteboard strategy | delivered (25 KB) | — | PNG-only, one call, no explicit clear; TIFF synthesised for readers |
 | gap-fill E1 thumbnail | delivered (31 KB) | — | `:show(0.12)` entrance, clipboard before decode, cached screen frames |
 | gap-fill F1 module split + bench | delivered (51 KB + 28 KB addendum) | — | package.path bootstrap, dead reload guard, pcall per module, `isOccluded()` oracle, whole-second hs.fs timestamps |
-| K3 KeepAlive / ThrottleInterval / TCC / double launch | not run | not run | measured §F6 |
-| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | not run | not run | measured §F7, §F3; K2's refuters confirmed inode stability across all three names |
-| K5 PNG-only pasteboard suffices for Claude Code | not run | not run | binary evidence §F5 |
-| K6 SIGTERM by the census bug; nothing restarts Hammerspoon | not run | not run | launchd log §F1 |
+| gap-fill C1 kqueue helper vs the poll | delivered (32 KB) | — | helper **rejected** (4 ms p50 / 7 ms p99 for a new blind spot + a second unsupervised process); the axis instead found the shipped signature's own blind spot — §F7, §5 option E, failure mode 14 |
+| K3 KeepAlive / ThrottleInterval / TCC / double launch | **refuted, 85 %** | **refuted, 80 %** | KeepAlive re-forks a *mature* job in ≈1 ms **at the default 10 s throttle too** (measured 0.5–1.7 ms, n=15), provided the job ran ≥ ThrottleInterval before exiting; `ThrottleInterval=1` therefore only shortens crash-loop backoff — into a 1 Hz loop. The plan keeps the **default** throttle; the downtime bound is Hammerspoon's own start (~0.6–2 s), not launchd |
+| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | **refuted, 90 %** | **refuted, 90 %** | The invariant holds and is sharpened — a directory's st_size is 32 × (entries + 2), moving only with the **net** entry count (+32 create/hard-link/rename-in, −32 unlink/rename-over, **0 same-directory rename**, name-length independent). What is refuted is the *sufficiency*: the size moves **once** per screenshot, at the streaming temp's creation, and a single listing then **races Apple's two renames (~5 % of shots)**. Phase 2's scan re-lists until its inode count reconciles with `size/32 − 2` and opens each new inode by its current name |
+| K5 PNG-only pasteboard suffices for Claude Code | **stands, 88 %** | **stands, 85 %** | Both of Claude Code's clipboard read paths are PNG-native: the primary is an embedded Rust napi module (`image-processor.node`, identical in 2.1.114 and 2.1.260) that asks `NSPasteboard` for `public.png` **first**; the osascript `«class PNGf»` route is its fallback. §F5 |
+| K6 SIGTERM by the census bug; nothing restarts Hammerspoon | **refuted, 88 %** (narrative details, not the cause) | **stands, 85 %** | The cause holds: Hammerspoon[1961] exited 2026-09-09 18:55:16 on SIGTERM (runningboardd code 2,15,15) during session e2cc5a62's `LA_PAT=… ps \| awk -v p="$LA_PAT" 'index($0,p)'` kill census. Three details corrected: it was **one ~2 s pass killing 76 processes**, the census selected **every line of `ps -ax`** (all users, root included), and **875/878 was the peer's next-day re-run**, not this event. §F1 |
 
 Two workflow runs (17 slots each) and three bare research agents died on 5-hour session limits
 (resets 02:30 and 11:40 CDT); the recovery ledger is `~/.reso/limit-recover/<session>/`. The
@@ -364,6 +400,7 @@ collected in this session, and the plan's bench (Phase 5) re-measures each one a
 | 11 | FSEvents/fseventsd livelock | fixed 2026-09-08 (poll) | unchanged — the poll asks the kernel |
 | 12 | Thumbnail stranded / dismissed by a click on its predecessor | fixed 2026-07-21 | unchanged |
 | 13 | Log grows without bound at a 10 ms poll error rate | truncated only at load | rotate on write, rate-limit errors |
+| 14 | **Final rename lands in the last ~30 ms of a wall-clock second** — the `mtime:ctime:size` signature and the `HOT_EVERY` rescue are both blind to it (C1, §F7) | **live, ~3 % of shots at the shipped 50 ms poll**; detection deferred until the *next* screenshot (one production instance: 6 026 ms) | signature → `st_size` alone, delete `HOT_EVERY`, trigger on creation not on the final name (Phase 2 + the one-line Phase 1 fix) |
 
 ## 5. Architecture options and the deciding facts
 
@@ -373,7 +410,7 @@ collected in this session, and the plan's bench (Phase 5) re-measures each one a
 | B. hybrid: hotkey destination = clipboard, Hammerspoon polls changeCount and writes the archive | Apple writes the pasteboard directly; probably no mds call (unmeasured) | clipboard yes; **archive file NO** while Hammerspoon is down | worth one experiment; changes the user's archive semantics and must discriminate screenshots from other image copies |
 | C. Hammerspoon owns ⌘⇧4 (`screencapture -i` via hs.task) | ~50–100 ms; exact completion callback | **no** — dead key | rejected: dead-key failure mode, Sequoia's spawner nag, unproven eventtap visibility |
 | D. native capture (`hs.screen:snapshot`, own crosshair UI) | 33–86 ms | no | rejected: loses the system crosshair/magnifier/window mode; the nag by design |
-| E. kqueue/dispatch-vnode helper instead of the poll | saves ≤ 10 ms over a 10 ms poll | n/a | not worth a compiled dependency yet; measured jitter makes the poll sufficient (gap-fill axis C1 pending) |
+| E. kqueue/dispatch-vnode helper instead of the poll | **p50 0.503 / p99 4.224 ms** rename→Lua callback through `hs.task` (n=35) vs the 10 ms poll's p50 4.705 / p99 11.050 ms | n/a | **rejected on measurement, C1**: the whole prize is ~4 ms p50 / ~7 ms p99 on a path that already contains Apple's 16 ms PNG write (§F2) and a 250 ms slide-in (§F3), bought with a new blind spot the poll lacks (directory replacement ⇒ permanently deaf), a second unsupervised process, and a compiled artifact. Revisit only if the final-name rename becomes load-bearing again (`NOTE_RENAME` + `F_GETPATH` on a held fd is then genuinely better) |
 | F. FSEvents (`hs.pathwatcher`) | — | — | rejected 2026-09-08: went blind for a day; 5 of 13 shots lost |
 
 ## 6. Open questions and what closes each
@@ -385,7 +422,8 @@ collected in this session, and the plan's bench (Phase 5) re-measures each one a
 | Spotlight index: 3.06 M of 15.6 M documents are abandoned projects' `node_modules` under `~/Development` | shrinks the indexer's standing work; operator-side | add those directories (or `~/Development` minus the active repos) to Spotlight Privacy; B1 report §6 |
 | What loads `mds` on this box? | fleet-wide cost; Finder/Spotlight suffer too | gap-fill axis B1 (pending); hand to claude-infrastructure |
 | Any consumer that needs `public.tiff`? | PNG-only is the fast path | pasteboard translations cover TIFF readers (§F5); keep a one-line switch to add TIFF |
-| kqueue helper vs 10 ms poll | ≤ 10 ms | gap-fill axis C1 (pending) |
+| ~~kqueue helper vs 10 ms poll~~ | ~~≤ 10 ms~~ | **closed by C1 (2026-09-10)**: helper measured 4 ms faster at p50, rejected; the axis instead found the production signature blind spot (§F7, failure mode 14) |
+| Population miss-rate of the current `mtime:ctime:size` signature | C1 models ~3 % of shots at the shipped 50 ms poll from n=190 synthetic cycles, against n=1 production instance | after the `st_size`-only signature lands, the poll's own log makes it directly countable (C1 §12) |
 | Thumbnail primitive costs (canvas build, 60 fps slide vs fade) | the last ~250 ms the user perceives | gap-fill axis E1 (pending); measured in the bench after landing |
 
 ## 7. Reproduce
