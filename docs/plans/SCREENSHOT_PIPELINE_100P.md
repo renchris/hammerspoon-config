@@ -129,6 +129,29 @@ the rename (KB §F2). Measured: 10 ms `hs.timer` is stable (p99 11.0 ms); creati
 directory's st_size by 32 B; the inode survives the rename; the PNG-only pasteboard write is 0.5 ms
 and is exactly what Claude Code reads (KB §F5, §F7).
 
+**B2 (disassembly, 2026-09-11) settles that this phase's approach is the ONLY one.** The stall is an
+unguarded straight-line call — `sub_100019794` at `0x1000192b4`, doing `MDItemCreate` →
+`MDItemSetAttributes` — sitting between `CGImageDestinationFinalize` (the PNG is complete) and the
+`moveItem` to the final name. **No preference, no directory exclusion and no flag reachable from
+outside the process removes it**; there is no branch to take. Three further constraints this phase
+must honour, all static:
+
+- 🚨 **Never treat a `screencapture` exit code as a capture verdict.** Escape cancels with **exit 0**
+  (keycode `0x35` → `mov w0,#0; bl _exit`), and ⌘-period does the same; an asleep display is exit 1
+  with nothing written. Any `hs.task` harness needs a display-awake precondition and an
+  artifact-based success test. The folklore "returns 1 on cancel" is wrong.
+- **`screencapture` does not exit until after the rename**, so anything that shells out and waits on
+  the process inherits the whole stall — only a directory watcher escapes it.
+- **`show-thumbnail` is `0` today and that is a precondition, not a constant.** Turning it on adds a
+  second, *user-paced* move owned by `screencaptureui`, and the inode/dotfile logic must be
+  re-validated against it. Free bonus available on the finished file: `kMDItemScreenCaptureType` as a
+  provenance field, if the log or thumbnail ever wants to distinguish ⌘⇧3/⌘⇧4/window shots.
+
+**Sequencing constraint from F2:** the settle loop's repeated full-PNG read is **latent today**
+(`screencapture` renames a complete file, so `settleStep` finds IEND on its first look — measured
+`settled` p50 29.5 ms, max 101 ms, n=30, zero give-ups) and **becomes live the moment this phase
+lands**. The tail-8-byte IEND check must therefore ship *with* step 3, not as a later optimisation.
+
 **And there is a live defect this phase closes, independent of the stall (C1, KB §F7, failure mode
 14).** The shipped poll keys on `mtime:ctime:size` at whole-second granularity, so a final rename
 landing in the last ~30 ms of a wall-clock second changes *nothing* it looks at, and `HOT_EVERY`
@@ -202,16 +225,46 @@ uses `SIGSTOP` on the child for 3 s) shows `copied` before `renamed` by ≥ 2.9 
 
 ## Phase 3 — Nothing synchronous on the main thread (W1)
 
-**Why.** KB §F4: the python3 Dock rebind (54 ms idle, seconds under load) and the hot rescans
-stall the poll and can disable the ⌘V→⌃V tap by timeout.
+**Why — RESTATED after F2's full audit (2026-09-11, live Hammerspoon at load 33–39); the original
+rationale was right in direction and wrong in magnitude.** The Dock rebind is **not** what blocks
+this pipeline: `com.apple.dock.plist` was written **twice in 24 h**, so `rebind()` runs ≈2×/day, and
+the poll tick is **6 µs**, the eventtap callback 15 µs. **Fix it for its TAIL, not its mean**:
+`hs.execute` is `io.popen` + `read('*a')` + `close()` — a synchronous fork/exec/waitpid **with no
+timeout at all**, median 43 ms and **worst case unbounded** (a hung `/usr/bin/python3` hangs the main
+thread forever, and the Xcode-CLT shim can block on a GUI dialog). That unbounded wait, not the
+54 ms, is the reason to remove it.
 
-**Design.** `dock.lua`: `hs.plist.read` (8.6 ms measured) replaces the python spawn; the rebind
-runs from a 0.5 s coalescing timer as today; `hs.alert.show` stays but shortened to 0.4 s (cosmetic).
-`hs.mouse.getCurrentScreen()` (20 ms measured) is called once per thumbnail, after the copy is
-verified, so it is off the clipboard path; if E1's numbers show it dominating the thumbnail
-entrance, replace with `hs.mouse.absolutePosition()` + `hs.screen.allScreens()` frame containment.
-`hs.sound.getByName("Pop")` (3.9 ms) is loaded once at start and reused. No `hs.execute`,
-`os.execute`, `io.popen` or `hs.osascript` anywhere on a timer callback; `hs.task` only.
+**What actually costs main-thread milliseconds is elsewhere, and Phases 2/4 own it**: ~120 ms per
+*shot* (TIFF materialisation `init.lua:440-442` at 52 ms + the thumbnail's first render at 69 ms) —
+40× the rebind's entire daily total, every shot.
+
+**Also corrected (KB §F4 table): these were first-call artifacts, not per-shot costs.** The 20 ms
+`getCurrentScreen` is **8 µs** median, the 3.9 ms `getByName("Pop")` is **4 µs**, `hs.plist.read` is
+**1.88–2.02 ms** not 8.6, the 7 ms listing is **1.97 ms** median. And **the ⌘V→⌃V tap self-heals** —
+`libeventtap.m` re-enables on both `kCGEventTapDisabledByTimeout` and `…ByUserInput` — so a stall
+drops events during it but does not leave the tap dead. Hostile review item 6 is half wrong.
+
+**Design.** `dock.lua`: `hs.plist.read` replaces the python spawn — for the unbounded-wait removal;
+the rebind runs from a 0.5 s coalescing timer as today; `hs.alert.show` stays but shortened to 0.4 s
+(cosmetic). `hs.mouse.getCurrentScreen()` is called once per thumbnail after the copy is verified,
+so it is off the clipboard path; E1's replacement (`hs.mouse.absolutePosition()` +
+`hs.screen.allScreens()` frame containment) stays — it is genuinely cheaper and cleaner — but its
+saving is ~8 µs/shot, not 20 ms, so it is not a latency lever. `hs.sound.getByName("Pop")` is loaded
+once at start and reused (saves 4 µs, kept for tidiness). No `hs.execute`, `os.execute`, `io.popen`
+or `hs.osascript` anywhere on a timer callback; `hs.task` only.
+
+**New in this phase — warm the lazy modules at load (F2 §9; nobody had proposed it).** `hs.mouse`,
+`hs.screen`, `hs.sound` and `hs.canvas` are first touched inside `settleStep`/`showThumbnail`, so
+**the first screenshot after every Hammerspoon launch pays ~20–40 ms of module loading on the user's
+latency path** — and this box relaunches often (3 `poll armed` lines on 2026-09-10, two 46 minutes
+apart). One line at load moves it off the first shot:
+`hs.mouse.absolutePosition(); hs.sound.getByName("Pop"); hs.canvas.new({x=0,y=0,w=1,h=1}):delete()`.
+
+**And a stall is never made up.** A 351 ms block across a 50 ms repeating timer produced **seven
+missed fires collapsed into one** — CFRunLoopTimer coalesces and does not catch up. Detection latency
+for a shot inside a stall of duration *D* is therefore `D + one scan`. Nothing is lost (the catch-up
+tick's `hs.fs.dir` sees the new name), which vindicates the 2026-09-08 name-dedup choice; it is purely
+latency. This is why the bench's stall test must assert on latency, not on loss.
 
 ## Phase 4 — Thumbnail: fastest visible, same guarantees (W1; numbers from E1 when it lands)
 
@@ -324,11 +377,17 @@ proven, its remaining value is negative.
 
 ## Phase 7 — Experiments (W5, optional; each one closes an open question)
 
-1. **Clipboard-destination hybrid** (devil's advocate, KB §5 B): scriptable — `screencapture -x -c
-   -R <rect>` under the bench's pasteboard snapshot/restore with the unified log open (F1 addendum
-   §23); no operator keystroke needed. If the clipboard path skips the `mds` call, document it; the
-   pipeline still keeps file-watch as primary because the archive file must land even when
-   Hammerspoon is down. Known already: `-c` writes exactly one flavor, PNG (D2 §7).
+1. **Clipboard-destination hybrid** (devil's advocate, KB §5 B) — **the experiment's QUESTION is now
+   answered statically by B2; only its product decision remains.** `-c` **structurally cannot stall
+   on Spotlight**: every `MDItem*` call site in the binary sits inside the file-writing function or
+   its helper, and the clipboard function (`0x100019954`) contains none and reaches none. It also
+   writes **exactly one flavor** — a single `PasteboardPutItemFlavor` call site, not in a loop, on
+   `PasteboardCreate("com.apple.pasteboard.clipboard")` — which upgrades D2 §7 from reasoned to
+   static fact and confirms **PNG-only is what Apple's own Control-held capture does**. So no
+   measurement run is needed to decide whether the stall is skipped; it is. What remains is purely a
+   product call: the pipeline still keeps file-watch as primary because **the archive file must land
+   even when Hammerspoon is down**, and the clipboard destination changes the user's archive
+   semantics. Cost of running it anyway: one capture, for the changeCount timing only.
 2. **Pasteboard watcher for Ctrl-held / ⌘⇧5 → clipboard captures**: a foreign `changeCount` bump
    carrying `public.png` with no new file within 300 ms → thumbnail from the pasteboard (KB §F8 item 5).
 3. ~~**kqueue/dispatch-vnode helper**~~ — **CLOSED by C1 (delivered), do not re-open speculatively.**
@@ -401,6 +460,8 @@ proven, its remaining value is negative.
 | K5 PNG-only pasteboard suffices for Claude Code | **stands 88 % / 85 %** | Claude Code's native module asks for public.png first; osascript PNGf is its fallback |
 | K6 SIGTERM by the census bug; nothing restarts Hammerspoon | cause **stands 85 %**; three details corrected (one ~2 s pass, 76 kills; 875/878 was the next-day reproduction) | KB §F1/§F9 |
 | gap-fill B1 / E1 / F1 (+addendum) / D2 | **delivered** and integrated (Phases 1, 2, 4, 5, 7) | — |
+| gap-fill B2 (screencapture internals) | **delivered** (31 KB, disassembly) and integrated (Phase 2 preamble, Phase 7 item 1, KB §F2) | The stall is an unguarded straight-line call (`sub_100019794`), so no preference or exclusion can remove it — the dotfile copy is the ONLY fix. Three constraints adopted: **Esc cancels with exit 0** (never use the exit code as a capture verdict), `screencapture` does not exit until after the rename, and `show-thumbnail=0` is a precondition rather than a constant. `-c` cannot stall and writes exactly one flavor — D2 §7 upgraded from reasoned to static |
+| gap-fill F2 (main-thread blockers) | **delivered** (40 KB, live Hammerspoon at load 33–39) and integrated (Phase 3 rewritten, KB §F4 rewritten) | **Refutes this plan's own magnitudes**: the Dock rebind runs ≈2×/day, not continuously, and five headline figures (20 ms `getCurrentScreen`, 3.9 ms `getByName`, 8.6 ms `plist.read`, 7 ms listing, 27–60 µs stat) were **first-call module-load artifacts**. The rebind is still removed — for its **unbounded** tail (`hs.execute` has no timeout), not its mean. Real per-shot cost is ~120 ms of image work. The eventtap **self-heals**; the settle loop's repeated read is latent until Phase 2 lands. New: warm the lazy modules at load (~20–40 ms off the first shot after every relaunch) |
 | gap-fill C1 (kqueue helper vs the poll) | **delivered** (32 KB, conviction 88 %) and integrated (Phase 2 step 1, Phase 7 item 3, decision log) | Helper **rejected on its own numbers** (~4 ms p50 / ~7 ms p99 saved, for a permanent-deafness failure mode + a second unsupervised process). The axis's real yield is the opposite finding: the **shipped** `mtime:ctime:size` signature has a structural blind spot — ~3 % of shots at the 50 ms poll, one production instance at 6 026 ms (KB §F7, failure mode 14) — closed by the one-line `st_size`-only signature |
 
 ## Risks and rollbacks

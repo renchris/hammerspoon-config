@@ -144,6 +144,33 @@ The unified log of the 23:59:59 capture (pid 85239), with the file's own timesta
   (`screencapture -x -R … <file>`) into an indexed folder, a `.noindex` folder and `/tmp` **all**
   opened the `com.apple.metadata.mds` connection. The call is made per file regardless of index
   state; only its latency varies with mds's health (0.13 s vs 1.2 s vs 10 s for the same command).
+  **B2 upgraded this from a 15/15 empirical result to a structural one by disassembly: the stall
+  lives in one unconditional helper, `sub_100019794`, called at `0x1000192b4` between
+  `CGImageDestinationFinalize` and the `moveItem`. It does `MDItemCreate` → `MDItemSetAttributes`
+  and nothing else, and it is guarded by no flag, no directory test and no preference — there is no
+  branch to take.** `MDItemCreate` is the call that opens the `com.apple.metadata.mds` connection
+  (isolated in a 40-line probe calling only those two functions). This is the mechanical reason
+  B1's lever L7 ("exclude `~/Screenshots` from Spotlight") is dead, and why the only fix is to stop
+  waiting for the final name.
+
+**The instruction-level ordering (B2, static — one code path serves keyboard and CLI, the single
+`CGImageDestinationCreateWithURL` call site at `0x10001921c` confirming K2).**
+
+| # | addr | what happens | consequence |
+|---|---|---|---|
+| 1 | `0x10001921c` | `CGImageDestinationCreateWithURL` — ImageIO opens the atomic-write session and picks `<dir>/..<name>.png-XXXX` | NULL ⇒ exit 1, no metadata, no file |
+| 2 | `0x100019278` | `CGImageDestinationAddImage` | — |
+| 3 | `0x100019288` | `CGImageDestinationFinalize` — **the PNG is complete on disk**; ImageIO atomically renames to `.<name>.png` (same inode, same sha256, mtime frozen) | **the instant the dotfile copy must fire on** |
+| 4 | `0x1000192b4` | `bl sub_100019794` — **the metadata helper, unconditional** | the entire stall |
+| 5–6 | `0x1000192f4` | `moveItemAtPath:toPath:` — `.name.png` → `name.png`; this rename is the file's `ctime` | the user-visible "few seconds" is step 4 sitting in front of this line |
+| 7 | `0x100019300` | move failed ⇒ `os_log` + **return 2** | |
+| 8 | `0x10001965c` | success only: `_MDItemMarkAsUsedWithURL(finalURL)` | **after** the final name exists — off the user-visible path even if it blocks |
+
+Two consequences the design takes from the ordering: the metadata call sits between *a complete file
+under a hidden name* and *the final name*, so a watcher keyed on the final name pays the whole stall
+and one keyed on the hidden name pays none of it; and **`screencapture` does not exit until after the
+rename**, so any caller that shells out and waits on the process (an `hs.task` bench, the retired
+`screenshot-to-clipboard.sh` fallback) inherits the full stall, while a directory watcher does not.
 - The `mds` server on this box: pid 634 at ~20 % CPU, `mds_stores` ~36 % CPU / 2.4 GB RSS, a
   continuous stream of CoreDuet context fetches and "Failed to resolve entitled attributes" for
   short-lived client pids. `~/.claude` (a dot-directory) is not indexed (`mdfind` count 0). Which
@@ -177,6 +204,30 @@ The unified log of the 23:59:59 capture (pid 85239), with the file's own timesta
   renames) and re-resolve by inode on ENOENT. Keyboard-path temp spelling was observed live in
   July 2026 (commit `8e0173a`) and follows from the shared call site; no keyboard shot occurred
   during this session's watch windows. 0 stranded hidden files exist among 3,374 entries.
+
+**`screencapture`'s contract with a caller — three facts that contradict folklore (B2, static).**
+
+- 🚨 **Escape CANCELS WITH EXIT STATUS 0, not 1.** Keycode `0x35` in the event handler branches
+  straight to a helper whose only tail is `mov w0,#0; bl _exit`; ⌘-period (`0x2f`) does the same.
+  **An `hs.task` caller therefore cannot distinguish "user cancelled" from "success" by exit code
+  and must test for the artifact.** The widely repeated "returns 1 on cancel" is wrong.
+- **An asleep display is exit 1 with nothing written** (`SLSGetActiveDisplayList returned 0
+  displays`), and that path never touches Spotlight. Both of this session's allowed capture probes
+  hit exactly this, ~60 s apart — so any unattended bench needs a display-awake precondition, not
+  just an exit-code check.
+- **Of the `com.apple.screencapture` defaults, `/usr/sbin/screencapture` itself reads exactly one —
+  `include-date` — and it only shapes the generated filename.** `name`/`style`/`target`/`type` are
+  read by `screencaptureui`; `location`/`show-thumbnail` by neither. **None adds or removes the
+  metadata call.** Known precondition: `show-thumbnail` is `0` today; turning it on adds a second,
+  *user-paced* move owned by `screencaptureui`, and the inode/dotfile logic must be re-validated
+  against it.
+- **The `-c` (clipboard) path structurally cannot stall on Spotlight**: every `MDItem*` call site in
+  the binary is inside the file-writing function or its helper, and the clipboard function
+  (`0x100019954`) contains none and reaches none. It also writes **exactly one flavor** — a single
+  `PasteboardPutItemFlavor` call site, not in a loop, on
+  `PasteboardCreate("com.apple.pasteboard.clipboard")`. This upgrades D2 §7 from reasoned to a
+  static fact, and means **PNG-only is what Apple's own Control-held capture does** — §F5's
+  recommendation is the ecosystem default, not a deviation.
 
 ### F3 — Hammerspoon's own path after the rename (latency class B)
 
@@ -226,17 +277,64 @@ Every real keyboard screenshot since the poll landed on 2026-09-08 (n = 20), ms:
 
 ### F4 — Main-thread hazards (reliability class B)
 
-- `rebind()` (Dock shortcuts) runs `hs.execute(python3 …)` **synchronously** on every
-  `com.apple.dock.plist` change: 54 ms at load 22, seconds at load 200+. `hs.plist.read` reads the
-  same plist natively in 8.6 ms (7 persistent-apps, `file-label`/`bundle-identifier` intact).
-  Frequency is low (0 Dock-plist events in a 188 s window, 18 other prefs writes), but each one
-  stalls the poll and every settle timer; a >1 s stall also disables the ⌘V→⌃V eventtap by timeout
-  (hostile review item 6).
-- The "hot second" rescans (every other tick while the directory's mtime is the current second)
-  cost up to ~10 listings × 7 ms per changed second; at a 10 ms poll they would be 50 × 7 ms = 35 %
-  of a core. The redesign removes the need for them (§F7).
+🚨 **F2's full audit (2026-09-11, in the LIVE Hammerspoon at load 33–39) refutes this section's
+original magnitudes. The direction was right; the numbers were first-call artifacts.** Hammerspoon
+lazy-loads extension modules on first reference and Cocoa caches behind several of these APIs, so an
+`n=1` or a `min/med` from a fresh bench measures **module load, not the call**:
+
+| figure as previously recorded | where | F2's measurement | what the old number actually was |
+|---|---|---|---|
+| `hs.mouse.getCurrentScreen()` 20 ms | §F3, E1 | n=20: **med 0.008 ms**, max 6.83 | lazy load of `hs.mouse`+`hs.screen`+`hs.geometry`+`hs.fnutils` — **not a per-shot cost** |
+| `hs.sound.getByName("Pop")` 3.9 ms | F2-lead | n=10: **med 0.004 ms**, max 14.4 | `NSSound soundNamed:` caches by name; caching the object saves **4 µs** after shot #1 |
+| `hs.plist.read` 8.6 ms | below | **1.88–2.02 ms** (n=10, two runs) | cold was 6.4 ms |
+| directory listing 7.0 ms | §F3, C1 | **1.97 ms med**, 19.85 ms max (n=5) | median 3.5× lower, tail 2.8× higher than the single figure |
+| poll `stat` 27–60 µs | §F3 | **6 µs for the whole tick** (n=200) | — |
+
+**The real cold-start cost is not zero, it is paid once — on the user's latency path.** `hs.mouse`,
+`hs.screen`, `hs.sound` and `hs.canvas` are all first touched inside `settleStep`/`showThumbnail`, so
+**the first screenshot after every Hammerspoon launch pays ~20–40 ms of module loading** — and this
+box relaunches often (3 `poll armed` lines on 2026-09-10 alone, two of them 46 minutes apart). One
+line at load fixes it: `hs.mouse.absolutePosition(); hs.sound.getByName("Pop");
+hs.canvas.new({x=0,y=0,w=1,h=1}):delete()`. Cheap, and nobody had proposed it.
+
+- **`rebind()` is NOT the pipeline's blocker — fix it for its TAIL, not its mean.** The Dock plist
+  was written **twice in the last 24 h** (and 0 times in 99 s of direct observation), so `rebind()`
+  runs ≈2×/day, not continuously. But `hs.execute` is `io.popen` + `read('*a')` + `close()`
+  (`_coresetup.lua`) — a synchronous fork/exec/waitpid **with no timeout at all**. Median 43 ms;
+  **worst case unbounded**: a hung `/usr/bin/python3` hangs Hammerspoon's main thread forever, and
+  the Xcode-CLT shim at that path can block on a GUI dialog. `hs.plist.read` is a 23× mean speedup
+  *and removes an unbounded wait from the process* — the real argument. (The replacement is proven
+  byte-identical, F2 §4.)
+- **A stall costs the poll its full duration and is never made up.** Measured: a 351 ms block across
+  a 50 ms repeating timer produced `before=10 after_block=10 after_drain=11` — **seven missed fires
+  collapsed into exactly one.** CFRunLoopTimer coalesces; it does not catch up. So detection latency
+  for a shot landing inside a stall of duration *D* is **D + one scan**. Nothing is *lost* (the
+  catch-up tick's `hs.fs.dir` sees the new name), which retroactively vindicates the 2026-09-08
+  rewrite's choice of name-dedup — it is purely a latency cost.
+- **What actually blocks on every single shot is ~120 ms of image work**: the TIFF materialisation at
+  `init.lua:440-442` (**52 ms cold**, n=5) plus the thumbnail's first on-screen render (69 ms, E1).
+  That is 40× the Dock rebind's entire daily total, per shot. Ranked main-thread ms/day on this box:
+  TIFF ~1,600 · thumbnail first render ~2,000 · the poll itself ~1,000 (6 µs × 1.73 M ticks) ·
+  `print()` in rebind ~28 · the python3 spawn ~87.
+- **The ⌘V→⌃V eventtap DOES self-heal — hostile review item 6 is half wrong.** Hammerspoon's
+  `libeventtap.m` handles both `kCGEventTapDisabledByTimeout` and `kCGEventTapDisabledByUserInput`
+  by calling `CGEventTapEnable(e->tap, true)` and logging `eventtap restarted`. A long stall still
+  *drops the events during it*, but the tap does not stay dead. The timeout duration itself remains
+  undocumented by Apple.
+- **The settle loop's repeated full-PNG read is LATENT, not live — and H2 makes it live.** All 30
+  `copied` lines show `settled` p50 **29.5 ms**, max 101 ms, n=30, zero `W`/`E` lines: 50 ms of
+  waiting would show as a floor at ~62 ms and 25 of 30 shots are below it. `screencapture` renames a
+  *complete* file into place, so `settleStep` finds IEND on its first look. The moment the design
+  copies from the dotfile instead, the loop starts actually iterating — so the tail-8-byte IEND check
+  must land **with** Phase 2, not after it.
+- The "hot second" rescans (every other tick while the directory's mtime is the current second) cost
+  up to ~10 listings per changed second — at the corrected **1.97 ms** median listing that is ~20 ms,
+  not the ~70 ms the 7 ms figure implied, and at a 10 ms poll ~50 listings ≈ 10 % of a core rather
+  than 35 %. **The case against them is no longer cost, it is correctness**: they are one half of
+  failure mode 14 (§F7), and C1 measured the size-only signature dropping the poll from 23.35
+  listings per shot to 1.00. The redesign removes them.
 - The settle loop reads the whole PNG every 50 ms while waiting (`f:read("*a")`, up to 3 MB); a
-  tail-8-byte IEND check is microseconds.
+  tail-8-byte IEND check is microseconds. (Latent today — see F2's finding above; live from Phase 2.)
 - `hs.image.imageFromPath` is lazy (0.5–0.9 ms); decoding happens when the canvas renders.
 - `hs.ipc.cliInstall()` is the unguarded first statement of `init.lua`; when the `Hammerspoon` port
   is already owned it raises and the entire config aborts (F1b). `hs.ipc` also replaces the global
