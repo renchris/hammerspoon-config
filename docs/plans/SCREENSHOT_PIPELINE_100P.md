@@ -28,7 +28,7 @@ relaunched again at 15:16:28 — still unsupervised.
 | PNG-complete → clipboard verified | rename-bound: 243 ms p50, 5.0 s p90, 10.2 s max | **≤ 15 ms p50, ≤ 30 ms p100** (10 ms poll + ≤ 1 ms PNG write + verify) |
 | capture (mouse-up) → clipboard verified | 243 ms p50 / 10.2 s max | **≤ 70 ms p50, ≤ 250 ms p99** (bounded by Apple's PNG write: 35 ms p50, 162 ms p99) |
 | capture → thumbnail fully visible | copied + 250 ms slide | **≤ 200 ms p50** (copied + ≤ 120 ms entrance) |
-| detector downtime after a SIGTERM/crash | hours (no supervision) | **≤ 2 s** (launchd respawn 0.05 s + Hammerspoon start) and the shot taken during it is still copied |
+| detector downtime after a SIGTERM/crash | hours (no supervision) | **≤ 2 s** (launchd re-fork ~1 ms + Hammerspoon start ~0.6–2 s) and the shot taken during it is still copied |
 | main-thread blocking on the poll path | python3 spawn (54–78 ms idle, seconds under load), TIFF 55 ms, Pop 7 ms, 10 hot rescans/s | **0 synchronous spawns, 0 encodes > 5 ms, 0 listings without a size change; bench R1 max tick gap ≤ 75 ms, R2 zero main-thread blocks > 100 ms** |
 | bench sample size | previous verifications used N = 3–10 | **N = 300 default** (a 1.1 % stall needs N ≈ 209 for 90 % odds of one observation); `analyze.py` prints the observed stall count and `INSUFFICIENT-N` when none was seen |
 
@@ -91,7 +91,8 @@ zombie — so supervision must key on a heartbeat, and the config must survive a
 **Design.**
 1. `launchd/org.hammerspoon.Hammerspoon.keepalive.plist` (user agent, `gui/$UID`):
    `ProgramArguments = [/Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon]`,
-   `KeepAlive = true`, `RunAtLoad = true`, `ThrottleInterval = 1`, `ProcessType = Interactive`,
+   `KeepAlive = true`, `RunAtLoad = true`, default `ThrottleInterval` (K3 refuters: a mature job
+   respawns in ~1 ms regardless; `=1` would only turn a start-up crash into a 1 Hz loop), `ProcessType = Interactive`,
    `LimitLoadToSessionType = Aqua`, `AssociatedBundleIdentifiers = org.hammerspoon.Hammerspoon`.
    Install with `launchctl bootstrap gui/$UID <plist>` (never `load`), remove with `bootout`.
 2. Remove the Login Item (`osascript -e 'tell application "System Events" to delete login item
@@ -140,10 +141,15 @@ the PNG-only pasteboard write is 0.5 ms and is exactly what Claude Code reads (K
    candidate is dropped. Name spelling — either hidden form, final, `hs-bench-…`, a Finder copy —
    is irrelevant; the 30 s creation window excludes Finder duplicates of old shots and sync-client
    churn (KB §F8 item 7).
+2b. **Reconcile** (K4 refuters): a size change means the entry COUNT changed, and a 7 ms listing
+   races Apple's renames (an entry mid-rename is missed ~20 % of listings). After every size change,
+   re-list every tick until the inode set's size equals `size/32 − 2` (bounded at 10 ticks), opening
+   each not-yet-open inode by whatever name it currently carries; ENOENT on open means the name moved
+   under us — the next listing finds the same inode under its new name.
 3. **Settle** per candidate, every 10 ms, through the open handle: `size = f:seek("end")`, then
    `f:seek("set", size − 8)` and read 8 bytes until they equal IEND (0.17 ms) — IEND only, no
    size-stability fallback (the streaming temp plateaus between 16 KB chunks and must never be
-   copied early). Cap 15 s, then one `W` line, close the handle and release.
+   copied early). Cap 30 s (K1: the stall is unbounded — 13.7 s and 29.4 s observed), then one `W` line, close the handle and release.
 4. **Copy — before any decode**: read the file once through the handle (3 ms for 2.4 MB),
    `hs.pasteboard.writeAllData(nil, {["public.png"]=bytes})` with NO explicit `clearContents` (the
    wrapper clears; the explicit call is a second changeCount bump that wakes pollers on an empty
@@ -352,12 +358,12 @@ proven, its remaining value is negative.
 
 | claim | verifier verdicts | status |
 |---|---|---|
-| K1 mds XPC timeout after the PNG is complete | not run (two workflow runs died on session limits) | primary evidence in KB §F2; K2's refuters independently re-derived the mds → mdwrite → rename sequence |
+| K1 mds XPC timeout after the PNG is complete | **stands, 80 %** (mechanism); measurement lens not run (cap) | blocking call is MDItemSetAttributes; the stall is unbounded (13.7 s, 29.4 s seen) — no 10 s assumption anywhere (Phase 2 cap 30 s; Phase 6) |
 | K2 hidden temp, same inode, bytes final at mtime | **stands** — mechanism 85 %, measurement 88 % (two independent refuters, 0.5 ms hashing pollers, binary call-site analysis, 18 joined keyboard shots) | corrections adopted: three-name lifecycle (`..X.png-XXXX` → `.X.png` → final), the race is a MISS not a wrong image, fd-open remedy in Phase 2 steps 2–5, gain qualified (median 5–10 ms; ≥ 1 s in 4.6 %; 10 s in 1 %) |
-| K3 KeepAlive/ThrottleInterval/TCC/double-launch | not run (session limits; re-run is the operator's quota call) | measured KB §F6 |
-| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | not run (session limits; re-run is the operator's quota call) | measured KB §F7, §F3 |
-| K5 PNG-only pasteboard suffices for Claude Code | not run (session limits; re-run is the operator's quota call) | binary evidence KB §F5 |
-| K6 SIGTERM by the census bug; nothing restarts Hammerspoon | not run (session limits; re-run is the operator's quota call) | launchd log KB §F1 |
+| K3 KeepAlive/ThrottleInterval/TCC/double-launch | **refuted 85 % / 80 %** — KeepAlive respawns a mature job in ~1 ms at the DEFAULT throttle; TI=1 only shortens crash-loop backoff | Phase 1 keeps the default ThrottleInterval; downtime bound is Hammerspoon's own start (~0.6–2 s) |
+| K4 st_size invariant, 10 ms timer, inode dedup at verified copy | **refuted 90 % / 88 %** — size detects a count change once, a listing races the renames (~5 % of shots) | Phase 2 scan re-lists until inode count == size/32 − 2 and opens each new inode by its current name |
+| K5 PNG-only pasteboard suffices for Claude Code | **stands 88 % / 85 %** | Claude Code's native module asks for public.png first; osascript PNGf is its fallback |
+| K6 SIGTERM by the census bug; nothing restarts Hammerspoon | cause **stands 85 %**; three details corrected (one ~2 s pass, 76 kills; 875/878 was the next-day reproduction) | KB §F1/§F9 |
 | gap-fill B1 / E1 / F1 (+addendum) / D2 | **delivered** and integrated (Phases 1, 2, 4, 5, 7) | C1 (kqueue helper) not run — the 10 ms poll stands on the measured jitter; the bench closes it by measurement after landing |
 
 ## Risks and rollbacks
