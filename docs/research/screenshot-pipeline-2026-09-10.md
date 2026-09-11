@@ -135,8 +135,31 @@ The unified log of the 23:59:59 capture (pid 85239), with the file's own timesta
 | 00:00:12.984 | file ctime — **renamed to the final name**; process exits at 12.969–12.984 |
 | 00:00:19.079 | (fallback agent launch, throttled; Hammerspoon dead) |
 
+🚨 **The 30-day figures below are CONTAMINATED by this investigation's own CLI capture bursts, and
+the two K1 refuter lenses disagree about how much. Quote the partition, never the single number.**
+
+| | n | p50 | p90 | p95 | p99 | ≥ 1 s | ~10 s |
+|---|---|---|---|---|---|---|---|
+| full 30-day sample (as originally cited) | 610 | 11.2 ms | 240 ms | 954 ms | 9,922 ms | 4.75 % | 0.98 % |
+| **the 5 CLI-probe days** | 63 | 76 ms | 4,230 ms | 10,015 ms | 10,107 ms | 23.8 % | 7.94 % |
+| **the other 547 shots — the user baseline** | 547 | **10 ms** | **94 ms** | **364 ms** | **2,871 ms** | **2.6 %** | **0.18 % (1 shot)** |
+
+**K1/measurement (REFUTED, 88 %)** re-derived the cited distribution to within rounding and then
+partitioned it: 10.3 % of the sample supplies 5 of the 6 ~10 s events, a 44× difference in rate, and
+five ordinary days carry 103 shots with **zero** ≥ 1 s events. **K1/mechanism (stands, 80 %)
+disagrees on exactly this point** — it holds that CLI bursts *can* provoke an episode (08:44–08:46)
+but that the 00:00:02 keyboard stall had **no CLI capture in the preceding 16 minutes**, that the
+five keyboard episodes show a user-retry signature (a second shot 7–10 s after the first), and that
+contamination therefore accounts for **at most 1–2 of the 29 ≥ 1 s events, not the whole statistic**.
+Both lenses inspected primary evidence and neither is obviously wrong; the honest reading is that
+**the user-facing baseline is the non-probe column and the full-sample tail is a burst-load ceiling**,
+with the true contamination share unresolved. Nothing in the design depends on which is right — the
+dotfile copy removes the stall from the critical path either way — but no document should quote
+"p99 9.9 s" as the user's experience.
+
 - Distribution of that stall (ctime − mtime) over every screenshot: last 30 days, n = 611 — p50
-  11 ms, p75 27 ms, p90 225 ms, p95 0.92 s, p99 9.9 s, max 13.7 s; **4.6 % ≥ 1 s, 1.1 % ≈ 10.0 s**.
+  11 ms, p75 27 ms, p90 225 ms, p95 0.92 s, p99 9.9 s, max 13.7 s; **4.6 % ≥ 1 s, 1.1 % ≈ 10.0 s**
+  (**full-sample, contaminated — see the partition above**).
   All-time (n = 3,369): 83 % < 0.1 s, 3.3 % 0.1–1 s, 2.8 % 1–5 s, 0.5 % 5–10 s, 0.1 % the 10 s
   timeout; the ≥ 10 s class first appears in 2026-08 (1) and 2026-09 (4 of 77), i.e. as the fleet's
   load grew. The PNG write itself is never the problem: birth→mtime p50 16 ms, p99 162 ms, max 4.3 s.
@@ -204,6 +227,39 @@ rename**, so any caller that shells out and waits on the process (an `hs.task` b
   renames) and re-resolve by inode on ENOENT. Keyboard-path temp spelling was observed live in
   July 2026 (commit `8e0173a`) and follows from the shared call site; no keyboard shot occurred
   during this session's watch windows. 0 stranded hidden files exist among 3,374 entries.
+
+🚨 **The stall is NOT "the whole of the user's few seconds" — and the counterexample is the same shot
+C1 found independently.** K1/measurement joined the Hammerspoon log to file stats (n = 27): **median
+Apple stall 167 ms against a median 72 ms in Hammerspoon's own path**, median stall share **61 %** of
+capture→clipboard. The outlier runs the other way entirely: `Screenshot 2026-09-10 at 8.42.30 AM.png`
+had a **44 ms** stall and **6,089 ms inside Hammerspoon** — a multi-second user wait with essentially
+no Apple stall in it. **That is the very shot C1 independently traced to the poll's signature blind
+spot** (6,026 ms detection, ctime fractional second 0.987 — §F7, failure mode 14). Two refuters
+working different axes converged on one shot from opposite directions, which is the strongest single
+piece of evidence in this document: **the worst measured latency on this box was ours, not Apple's.**
+
+K1/mechanism, which did not refute the claim, reaches a compatible narrower version: the stall is the
+dominant (≥ 96 %) component of every multi-second delay measured *while Hammerspoon was running*
+(3 of 20 shots), while **median-shot latency is dominated by the 50 ms poll, the TIFF encode and the
+250 ms slide-in** — i.e. by §F3 and §F4, not by Apple. Design consequence: the dotfile copy removes a
+**tail**, not the median; the median is ours to fix.
+
+Two further corrections from K1/mechanism, both affecting attribution rather than the sequence:
+**the kMDItem xattrs are written in-process BEFORE the stall** and sit on the hidden file throughout
+— `mdwrite` is `_MDItemMarkAsUsedWithURL` *after* the rename, so attributing the xattr write to
+`mdwrite` is wrong — and **"times out at exactly 10 s" should read "mds's per-message server-side
+watchdog abandons the HEAD request at 10,000 ms"**: queued requests are released with the head
+(2.9–4.4 s, n = 5) or later (13.66 s keyboard; 29.4 s CLI released by another client's check-in with
+no timeout logged at all). **Of 29 ≥ 1 s stalls in 30 days only 6 are ~10 s timeouts; 22 are slow
+completions.** And "when mds is unresponsive" is wrong — mds was alive on 7 threads throughout; what
+it waits on needs root to measure.
+
+**One honest gap in the ordering** (K1/measurement): the mds connection activates at 00:00:02.950145,
+**3 ms before the file's birth** and 19 ms before the PNG is complete. "Complete PNG first, THEN the
+XPC call" is inferred from log silence rather than directly observed; only the *blocking*
+`MDItemSetAttributes` is plausibly after. K2's independent hashing pollers do confirm `.name.png` is
+complete at first appearance, so the operational conclusion survives — but the instruction-level
+ordering above (B2) is the load-bearing evidence for it, not the log.
 
 **`screencapture`'s contract with a caller — three facts that contradict folklore (B2, static).**
 
@@ -469,7 +525,7 @@ means the clipboard path skips the stall entirely. 14 days of logs contain zero 
 | claim | mechanism lens | measurement lens | outcome |
 |---|---|---|---|
 | K2 hidden temp, same inode, bytes final before the stall | stands, 85 % | stands, 88 % | corrections adopted above (three-name lifecycle; miss-not-corruption race; fd-open remedy; gain qualified) |
-| K1 mds XPC timeout after the PNG is complete | **stands, 80 %** | re-run in flight (fourth attempt) | sequence confirmed; four rewordings adopted — the blocking call is **`MDItemSetAttributes`** (screencapture's only Metadata imports are `MDItemCreate`, `MDItemSetAttributes`, `_MDItemMarkAsUsedWithURL`), and **the stall is unbounded, not a 10 s timeout**: 13.7 s and 29.4 s observed, so no 10 s assumption survives anywhere in the design (Phase 2 caps at 30 s). Primary evidence §F2; K2's refuters independently re-derived the mds/mdwrite/rename sequence and the 30-day distribution (n = 607: p50 11 ms, p90 221 ms, p99 9.95 s); B1 adds the contamination caveat |
+| K1 mds XPC timeout after the PNG is complete | **stands, 80 %** | **refuted, 88 %** | **The two lenses split, and the split is itself the finding.** Mechanism: the causal sequence survives. Measurement: three attached assertions do not — the 30-day tail is contaminated by this investigation's own CLI bursts (partition table above), "exactly 10 s" is a watchdog not a bound, and the stall is **not** the whole of the user's few seconds (median share 61 %; one 6.1 s wait was 44 ms Apple and 6,089 ms Hammerspoon — the same shot C1 traced to failure mode 14). The lenses **disagree** on contamination share (≤ 2 of 29 events vs 3–5× tail inflation) and it is left unresolved. Sequence confirmed; four rewordings adopted — the blocking call is **`MDItemSetAttributes`** (screencapture's only Metadata imports are `MDItemCreate`, `MDItemSetAttributes`, `_MDItemMarkAsUsedWithURL`), and **the stall is unbounded, not a 10 s timeout**: 13.7 s and 29.4 s observed, so no 10 s assumption survives anywhere in the design (Phase 2 caps at 30 s). Primary evidence §F2; K2's refuters independently re-derived the mds/mdwrite/rename sequence and the 30-day distribution (n = 607: p50 11 ms, p90 221 ms, p99 9.95 s); B1 adds the contamination caveat |
 | gap-fill B1 Spotlight load | delivered (28 KB) | — | mds not chronically busy; timeouts cluster after CLI bursts; index composition lever |
 | gap-fill D2 pasteboard strategy | delivered (25 KB) | — | PNG-only, one call, no explicit clear; TIFF synthesised for readers |
 | gap-fill E1 thumbnail | delivered (31 KB) | — | `:show(0.12)` entrance, clipboard before decode, cached screen frames |
@@ -480,10 +536,22 @@ means the clipboard path skips the stall entirely. 14 days of logs contain zero 
 | K5 PNG-only pasteboard suffices for Claude Code | **stands, 88 %** | **stands, 85 %** | Both of Claude Code's clipboard read paths are PNG-native: the primary is an embedded Rust napi module (`image-processor.node`, identical in 2.1.114 and 2.1.260) that asks `NSPasteboard` for `public.png` **first**; the osascript `«class PNGf»` route is its fallback. §F5 |
 | K6 SIGTERM by the census bug; nothing restarts Hammerspoon | **refuted, 88 %** (narrative details, not the cause) | **stands, 85 %** | The cause holds: Hammerspoon[1961] exited 2026-09-09 18:55:16 on SIGTERM (runningboardd code 2,15,15) during session e2cc5a62's `LA_PAT=… ps \| awk -v p="$LA_PAT" 'index($0,p)'` kill census. Three details corrected: it was **one ~2 s pass killing 76 processes**, the census selected **every line of `ps -ax`** (all users, root included), and **875/878 was the peer's next-day re-run**, not this event. §F1 |
 
-Two workflow runs (17 slots each) and three bare research agents died on 5-hour session limits
-(resets 02:30 and 11:40 CDT); the recovery ledger is `~/.reso/limit-recover/<session>/`. The
-unrun refutations are named gaps, not bridged: every claim above rests on primary evidence
-collected in this session, and the plan's bench (Phase 5) re-measures each one after landing.
+**Recovery status: COMPLETE (2026-09-11).** Two workflow runs (17 slots each) and several bare
+research agents died on 5-hour session limits (resets 02:30 and 11:40 CDT) across three successive
+sessions; the recovery ledger is `~/.reso/limit-recover/2d71c6d8-…/`. Every unit has since been
+re-run or consumed from disk under `/limit-recover` — **no verdict in this document is bridged, and
+no axis was dropped**. The last four gaps closed on a fourth account: K1's measurement lens (which
+refuted three of its own claim's attached assertions), the completeness critic, B2 and F2. C1 needed
+no re-run — it had finished on disk before its slot died.
+
+**Two things this wave established that are worth carrying forward.** First, **the adversarial
+two-lens structure earned its cost**: K1's lenses reached *opposite* verdicts on the same claim from
+the same evidence, and the disagreement (contamination share) is more informative than either verdict
+alone would have been. Second, **the most valuable findings refuted our own work, not Apple's** —
+the worst measured latency on this box was the poll's signature blind spot, five headline
+"measurements" were module-load artifacts, and the critic found three defects in the plan itself. The
+plan's bench (Phase 5) re-measures each claim after landing, and § Completeness critic lists the eight
+gaps that remain open with their owners.
 
 ## 4. Failure-mode catalogue (every way a shot fails today, and its status)
 

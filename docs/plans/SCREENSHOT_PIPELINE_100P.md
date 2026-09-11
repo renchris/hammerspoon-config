@@ -171,6 +171,16 @@ first — it is one line and it closes the defect.
    same-second rename. Measured with size-only: first-name detection p50 4.705 / p90 10.011 /
    p99 11.050 ms, 35/35 caught; and the poll's main-thread cost falls from 23.35 directory listings
    per shot to 1.00 — a bigger win than the rejected kqueue helper's 4 ms, at zero cost.)**
+1b. 🚨 **BACKSTOP — a 1 Hz unconditional rescan (critic item 5; this is NOT optional).** A size-only
+   signature is blind to a **net-zero tick**: K4/mechanism measured `create A + unlink B in one
+   interval → Δsize 0` (n=20). Since step 2b only runs "after a size change", such a tick would lose
+   the shot **with no later trigger at all** — the same unbounded-deferral shape as failure mode 14,
+   which this signature was chosen to close. This is not hypothetical: **Phase 5b's own bench deletes
+   each file after `copied`/`lost` in the same directory as the next capture 2 s later**, and the
+   directory demonstrably receives non-screenshot traffic (`IMG_4594.jpg`, a `.mov` from ⌘⇧5).
+   Cost of the backstop: one listing per second = **2.4 ms, ~0.24 % of a core**, invisible beside the
+   10 ms poll. Additionally, **the bench must unlink into a different directory** so it stops
+   manufacturing the failure it is grading.
 2. **Scan**: list the directory; for every name not in `seen` (a table of names) → `seen[name]=true`;
    candidate iff `hs.fs.attributes(path)` is a regular file with `creation ≥ now − 30 s`. **Open the
    file handle immediately and keep it** — Apple renames the same inode twice
@@ -180,11 +190,29 @@ first — it is one line and it closes the defect.
    candidate is dropped. Name spelling — either hidden form, final, `hs-bench-…`, a Finder copy —
    is irrelevant; the 30 s creation window excludes Finder duplicates of old shots and sync-client
    churn (KB §F8 item 7).
-2b. **Reconcile** (K4 refuters): a size change means the entry COUNT changed, and a 7 ms listing
-   races Apple's renames (an entry mid-rename is missed ~20 % of listings). After every size change,
-   re-list every tick until the inode set's size equals `size/32 − 2` (bounded at 10 ticks), opening
-   each not-yet-open inode by whatever name it currently carries; ENOENT on open means the name moved
-   under us — the next listing finds the same inode under its new name.
+2b. **Reconcile** (K4 refuters) — 🚨 **PREDICATE CORRECTED; the original was wrong three ways
+   (critic item 4, measured on disk).** A size change means the entry COUNT changed, and a listing
+   races Apple's renames (an entry mid-rename is missed ~20 % of listings), so after every size
+   change re-list every tick until the count reconciles, bounded at 10 ticks, opening each
+   not-yet-seen name and holding its handle; ENOENT on open means the name moved under us — the next
+   listing finds the same inode under its new name. **What changed, and why the original could never
+   have terminated:**
+   - **(a) Off by two under the API this plan actually uses.** `size/32 − 2` is right for POSIX
+     `listdir`, but `hs.fs.dir` **yields `.` and `..`**. Measured on the live directory: the shipped
+     arm line prints `3383 entries known` (screenshot.log 2026-09-10 16:02:48) against
+     `st_size 108256 / 32 = 3383`, while python `len(os.listdir())` = 3381. **Under `hs.fs.dir` the
+     predicate `== size/32 − 2` never holds, so the bounded loop would burn all 10 ticks on every
+     single shot.** The correct predicate is a **name-set count against `size/32`**.
+   - **(b) Wrong key.** The predicate counted *inodes*, but `hs.fs.dir` returns **names only** — only
+     `hs.fs.attributes` exposes `ino`, so an inode set means statting every entry: **18.0 ms per full
+     pass** (n=5: 17.3/18.0/18.3/18.4/21.3) versus **2.4 ms** for the listing alone. Up to ~180 ms of
+     main thread per shot — against Phase 3's own acceptance of "zero main-thread blocks > 100 ms".
+     **Stat only the names absent from `seen`.**
+   - **(c) Names and inodes are not 1:1** — each shot's inode wears three names in succession, so a
+     naive name-count reconcile drifts permanently upward while `st_size` does not move. The count
+     compared must be the directory's *current* name set, re-read each tick, never an accumulator.
+   - **Print both numbers at arm** (`entries known` and `size/32`) so the constant is measured on the
+     real volume rather than assumed.
 3. **Settle** per candidate, every 10 ms, through the open handle: `size = f:seek("end")`, then
    `f:seek("set", size − 8)` and read 8 bytes until they equal IEND (0.17 ms) — IEND only, no
    size-stability fallback (the streaming temp plateaus between 16 KB chunks and must never be
@@ -436,9 +464,14 @@ proven, its remaining value is negative.
   the Phase 5 bench.
 - **The poll's signature is `st_size` alone.** This is the one-line change C1 rates the
   highest-value line in its axis: it closes a live blind spot (failure mode 14 — ~3 % of shots at
-  the shipped 50 ms poll, one production instance at 6 026 ms) *and* drops main-thread cost from
-  23.35 listings per shot to 1.00. Safe only in combination with triggering on creation rather than
-  on the final name — which is exactly what Phase 2 does.
+  the shipped 50 ms poll, one production instance at 6 026 ms) *and* cuts the poll's listing load.
+  Safe only in combination with triggering on creation rather than on the final name — which is
+  exactly what Phase 2 does, plus the 1 Hz backstop of step 1b for the net-zero tick.
+  **Budget, stated so it does not contradict step 2b (critic item 12):** the target is
+  **1 listing per shot on an uncontested scan, ≤ N on a contested one (N = the 2b bound), plus 1/s
+  from the backstop** — *not* the flat "23.35 → 1.00" C1 measured on a synthetic run without a
+  reconcile loop. Phase 3's acceptance row must read that way too, and `analyze.py` must **print
+  observed listings-per-shot** so the real number is measured after landing rather than inherited.
 - **KeepAlive with ThrottleInterval=1, Login Item removed, Sparkle auto-update off** — the three
   together are what "exactly one instance, back in under a second" requires.
 - **Bounded retroactivity (15 s at arm)** replaces "never retroactive": the 2026-09-08 rationale
@@ -453,16 +486,47 @@ proven, its remaining value is negative.
 
 | claim | verifier verdicts | status |
 |---|---|---|
-| K1 mds XPC timeout after the PNG is complete | **stands, 80 %** (mechanism); measurement lens not run (cap) | blocking call is MDItemSetAttributes; the stall is unbounded (13.7 s, 29.4 s seen) — no 10 s assumption anywhere (Phase 2 cap 30 s; Phase 6) |
+| K1 mds XPC timeout after the PNG is complete | mechanism **stands, 80 %**; measurement **REFUTED, 88 %** — the two lenses split | Blocking call is MDItemSetAttributes; the stall is unbounded (13.7 s, 29.4 s seen) — no 10 s assumption anywhere (Phase 2 cap 30 s; Phase 6). **Three framing corrections adopted:** (1) the 30-day tail is contaminated by this investigation's own CLI bursts — the user baseline is the 547 non-probe shots (p90 94 ms, p99 2.9 s, ≥1 s 2.6 %), not p99 9.9 s; the lenses disagree on the share (≤2 of 29 events vs 3–5× inflation) and it stays unresolved. (2) Only 6 of 29 ≥1 s stalls are ~10 s timeouts; 22 are slow completions. (3) **The stall is a TAIL, not the median** — median share of capture→clipboard is 61 %, and the worst measured shot (6.1 s) was 44 ms Apple + 6,089 ms *ours*, the same shot C1 traced to failure mode 14. **The median is Phases 2–4's to fix, not Apple's.** |
 | K2 hidden temp, same inode, bytes final at mtime | **stands** — mechanism 85 %, measurement 88 % (two independent refuters, 0.5 ms hashing pollers, binary call-site analysis, 18 joined keyboard shots) | corrections adopted: three-name lifecycle (`..X.png-XXXX` → `.X.png` → final), the race is a MISS not a wrong image, fd-open remedy in Phase 2 steps 2–5, gain qualified (median 5–10 ms; ≥ 1 s in 4.6 %; 10 s in 1 %) |
 | K3 KeepAlive/ThrottleInterval/TCC/double-launch | **refuted 85 % / 80 %** — KeepAlive respawns a mature job in ~1 ms at the DEFAULT throttle; TI=1 only shortens crash-loop backoff | Phase 1 keeps the default ThrottleInterval; downtime bound is Hammerspoon's own start (~0.6–2 s) |
 | K4 st_size invariant, 10 ms timer, inode dedup at verified copy | **refuted 90 % / 90 %** — the invariant holds and sharpens (size = 32 × (entries + 2), moving only with the NET entry count, name-length independent), but it detects a count change ONCE and a 7 ms listing races Apple's two renames (~5 % of shots) | Phase 2 scan re-lists until inode count == size/32 − 2 and opens each new inode by its current name |
 | K5 PNG-only pasteboard suffices for Claude Code | **stands 88 % / 85 %** | Claude Code's native module asks for public.png first; osascript PNGf is its fallback |
 | K6 SIGTERM by the census bug; nothing restarts Hammerspoon | cause **stands 85 %**; three details corrected (one ~2 s pass, 76 kills; 875/878 was the next-day reproduction) | KB §F1/§F9 |
 | gap-fill B1 / E1 / F1 (+addendum) / D2 | **delivered** and integrated (Phases 1, 2, 4, 5, 7) | — |
+| completeness critic (Z) | **delivered** (14 KB, fresh context, 0 captures) — 12 ranked gaps, own measurements | 3 were defects in this plan and are **corrected above** (Phase 2 step 1b net-zero backstop; step 2b predicate off-by-two + wrong key + ~10× budget; decision-log listings budget). 8 remain open with owners in § Completeness critic — **items 1, 3 and 2 are pre-landing gates on W2, W1 and W4** |
 | gap-fill B2 (screencapture internals) | **delivered** (31 KB, disassembly) and integrated (Phase 2 preamble, Phase 7 item 1, KB §F2) | The stall is an unguarded straight-line call (`sub_100019794`), so no preference or exclusion can remove it — the dotfile copy is the ONLY fix. Three constraints adopted: **Esc cancels with exit 0** (never use the exit code as a capture verdict), `screencapture` does not exit until after the rename, and `show-thumbnail=0` is a precondition rather than a constant. `-c` cannot stall and writes exactly one flavor — D2 §7 upgraded from reasoned to static |
 | gap-fill F2 (main-thread blockers) | **delivered** (40 KB, live Hammerspoon at load 33–39) and integrated (Phase 3 rewritten, KB §F4 rewritten) | **Refutes this plan's own magnitudes**: the Dock rebind runs ≈2×/day, not continuously, and five headline figures (20 ms `getCurrentScreen`, 3.9 ms `getByName`, 8.6 ms `plist.read`, 7 ms listing, 27–60 µs stat) were **first-call module-load artifacts**. The rebind is still removed — for its **unbounded** tail (`hs.execute` has no timeout), not its mean. Real per-shot cost is ~120 ms of image work. The eventtap **self-heals**; the settle loop's repeated read is latent until Phase 2 lands. New: warm the lazy modules at load (~20–40 ms off the first shot after every relaunch) |
 | gap-fill C1 (kqueue helper vs the poll) | **delivered** (32 KB, conviction 88 %) and integrated (Phase 2 step 1, Phase 7 item 3, decision log) | Helper **rejected on its own numbers** (~4 ms p50 / ~7 ms p99 saved, for a permanent-deafness failure mode + a second unsupervised process). The axis's real yield is the opposite finding: the **shipped** `mtime:ctime:size` signature has a structural blind spot — ~3 % of shots at the 50 ms poll, one production instance at 6 026 ms (KB §F7, failure mode 14) — closed by the one-line `st_size`-only signature |
+
+## Completeness critic (Z, 2026-09-11) — what must close before these phases can honestly promise 100.00 %
+
+A fresh-context critic read the KB, this plan, all 17 gap-fill reports and the K1–K6 verdict JSON,
+ran **0 screencapture captures**, and ranked what is missing by risk to the 100.00 % / p100 claim.
+Items 4, 5 and 12 were **defects in this document** and are already corrected above (Phase 2 steps 1b
+and 2b, and the decision-log budget). The rest are open and owned here. `[E-mine]` = the critic's own
+measurement.
+
+| # | Gap | Why it bites | Cheapest close |
+|---|---|---|---|
+| **1** | **Phase 1's premise has never been run once.** Every Phase 1 number comes from a `/bin/sleep` proxy, and both K3 lenses state the TCC half is reasoned, untested | Launch provenance demonstrably decides which grants apply — a Hammerspoon exec'd from a terminal is attributed to **the terminal** (`tccd … responsible={net.kovidgoyal.kitty}`) `[E]`. `Program`-launching an `.app` binary outside LaunchServices is the one provenance nobody has exercised. If the launchd instance comes up without Accessibility, the ⌘V→⌃V tap is dead — **and step 2 has already deleted the Login Item, so the rollback path is the thing that just failed** | One operator-attended install with `supervise.sh uninstall` staged, asserting `hs.accessibilityState()`, `hs.screenRecordingState()`, the `poll armed` line and one real ⌘V — **before** step 2 removes the Login Item, not after |
+| **2** | **"Hammerspoon cannot start" has no owner, and Phase 6 removes the only thing covering it** | Default `ThrottleInterval` (correct, per K3) turns a start-up crash into a **6-relaunch/minute GUI loop forever** — no `SuccessfulExit` key, no sentinel, no notification. Not hypothetical: the live instance died of `EXC_BREAKPOINT` in `hs.ipc`'s logger on 2026-09-10 12:03:36, and a second instance's `init.lua` aborted at line 5. W1 lands new Lua into that same start path; W4 retires the fallback | Make the plist's `Program` a `supervise.sh --run` wrapper that refuses a 4th launch in 60 s, writes a breadcrumb and `hs.notify`s; **gate W4 on 7 days of clean supervision**, not on surviving one `launchctl kill TERM` |
+| **3** | **The keyboard path's hidden-name lifecycle has still never been observed live** — and the plan closes that only *after* landing | Phase 2 steps 2/2b/3/9 all key on it. If the keyboard path differs in a temp directory, a third rename, or its first 8 bytes at first sight, **W1 ships a detector that silently drops every real shot while the CLI bench prints `lost 0/300`.** Open question 1 defers this to "log the first real shot after landing" — validating the central premise with the artifact built on it | Before W1 lands: arm C1's already-built `…/c1-work/bin/kqwatch <dir> scan` (or a 5 ms hashing poller), operator takes **one** ⌘⇧4 shot, join to the unified log. One shot, zero CLI captures |
+| **6** | **Loss is unfalsifiable by the instrument the acceptance uses** | L1 is "0 real shots without a `copied` record", and `phase=lost` comes from a deadline timer **that only exists once a shot was detected**. Every failure class that matters — dead, crash-looping, blind — yields *neither* `copied` *nor* `lost`. Already true on disk: two shots from 2026-09-10 1.33 PM have **zero log lines of any kind** `[E-mine]` | A 5-minute launchd auditor doing the join that already found the 6 026 ms outlier (file birth times vs `copied` lines), notifying on a non-empty delta, and reading **a heartbeat file rather than `pgrep`** — the 12:03 incident proved a live pid is not a live pipeline |
+| **7** | **⌘⇧5 is a live modality here and nobody has measured its writer** | `Screen Recording 2026-09-04 at 1.07.44 PM.mov` is in `~/Screenshots` and `video = 1` in the defaults `[E-mine]`. B2 derived the lifecycle from `/usr/sbin/screencapture`, but `name`/`style`/`target`/`type` are read by **`screencaptureui`**, and its floating-thumbnail toggle re-introduces a second, user-paced move. The 30 s window, the handle-through-renames settle and the 30 s cap are all unvalidated for that writer | Read `show-thumbnail` and `target` at module start, **WARN on any value but `0`/`file`**, and take one ⌘⇧5 selection shot once the Phase-2 log emits hidden names |
+| **8** | **A file-less capture modality sits inside the 100.00 % claim but outside the committed phases** | Ctrl-held ⌘⇧4 and ⌘⇧5→clipboard produce **no file**, so there is no Pop and no thumbnail and the user reads it as failure. Leaving it "Phase 7, optional" makes the headline metric **false by construction** for a modality the machine supports | Either promote Phase 7 item 2 into W1 (`hs.pasteboard.watcher`: foreign `changeCount` carrying `public.png`, no new file within 300 ms ⇒ thumbnail from the pasteboard), **or write the modality out of the frozen scope in one line** so the metric means what it says |
+| **9** | **A second clipboard writer is running right now and nothing detects it** | `VoiceInk.app` pid 52167 is live `[E-mine]` — exactly G1 item 10's class. User shoots, dictates, VoiceInk restores its own snapshot, ⌘V pastes text — **and the log still reads `copied`, so the 7-day acceptance scores it a success** | After the verified write, one `changeCount` re-check at +300 ms; if it moved and we did not move it, log `clobbered`. One timer, ~5 µs |
+| **10** | **The user-visible end — ⌘V landing an image in Claude Code — is never measured** | L1/L2 stop at `sha1(pasteboard public.png) == sha1(file)`. Downstream: the tap drops events during a stall (duration unresolved), any browser copy hijacks ⌘V in terminals, and **Claude Code resizes anything wider than 2000 px** (`maxWidth:2000…`, ~140 ms) — while two of the last eight real shots are 3456 px wide `[E]` | One bench row reading the board back through **the same path Claude Code's fallback uses** (`osascript «class PNGf»` → temp → sha); and state in writing that the eventtap and foreign-writer classes are either in scope or out |
+| **11** | **The p100 latency targets are calibrated on a p85 image** | Every target derives from the 2516×1926 / 2.4 MB capture — **percentile 84.7** of 3,377 shots, with p99 = **5120×2880 / 20.6 MB** `[E]`. At that size the PNG-only pasteboard write alone is **3.00 ms p50** against 0.71 ms, and the thumbnail decode scales with pixels. **A p100 target defended by a p85 sample is not a p100 target**, and the bench's fixed `-R` rect keeps it that way | Make the bench's rect schedule sample the real distribution (≥ 1 full-display iteration per 20) and report targets **per size band** |
+
+**Explicitly not re-spent** (already verified, or already honestly stated as a limit): K2's hidden-name
+mechanism; K1's unbounded stall; K3's ~1 ms mature respawn; K4's ±32 invariant; K5's PNG-only
+sufficiency; the `-R`-is-not-the-keyboard-path caveat; the bench's mds-contamination caveat;
+`fullScreenAuxiliary` (W3); the Darwin-notification question (open question 5).
+
+🚨 **Gating consequence for Phase 0's wave order.** Items 1 and 3 are **pre-landing** gates on W2 and
+W1 respectively, and both need one operator-attended minute. Item 2 changes W4's gate from an event
+to a duration. These are not "nice to have before shipping" — each one is a path where the wave lands
+green and the pipeline is silently worse than today.
 
 ## Risks and rollbacks
 
@@ -474,6 +538,12 @@ proven, its remaining value is negative.
 | the 10 ms poll costs CPU under extreme load | 0.6 % of a core measured; the timer interval is one constant |
 | a consumer needs TIFF | `SCREENSHOT_TIFF=true` re-enables a delayed second write |
 | the bench perturbs the operator | idle guard, pointer-movement abort, clipboard snapshot/restore, self-cleaning files |
+| **the launchd instance comes up without Accessibility/Screen Recording** (critic 1 — never exercised; launch provenance decides grants) | operator-attended first install with `supervise.sh uninstall` staged, asserting both TCC states + one real ⌘V **BEFORE** the Login Item is deleted — never after |
+| **a start-up crash becomes an unbounded 6/min relaunch loop** with the fallback already retired (critic 2) | `supervise.sh --run` wrapper refuses a 4th launch in 60 s + breadcrumb + `hs.notify`; W4 gated on 7 days clean, not one kill test |
+| **the detector silently drops every real shot while the bench prints `lost 0/300`** (critic 3 — the keyboard lifecycle is still unobserved live) | one operator ⌘⇧4 under `kqwatch scan` **before** W1 lands; never validate the premise with the artifact built on it |
+| **a shot produces neither `copied` nor `lost`, so the 7-day metric cannot see it** (critic 6; two such shots already on disk) | 5-minute launchd auditor joining file birth times to `copied` lines, heartbeat file not `pgrep` |
+| **another app clobbers the clipboard after our verified write** (critic 9 — VoiceInk is live now) | `changeCount` re-check at +300 ms; log `clobbered` so the acceptance stops scoring it a success |
+| **⌘⇧5 / floating-thumbnail writer invalidates the settle assumptions** (critic 7 — `video=1` on this box) | read `show-thumbnail`/`target` at start, WARN on anything but `0`/`file` |
 
 ## Open questions (owner, closing action)
 
