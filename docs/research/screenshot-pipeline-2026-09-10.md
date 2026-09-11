@@ -10,10 +10,12 @@ only thing that copies and draws — was **dead for 5.4 hours** last night: a fl
 875 of 878 user processes at 18:55:16, Hammerspoon is a plain Login Item with nothing supervising
 it, and the launchd fallback that took over lost 3 of the 9 screenshots taken while it was down.
 (2) Apple's own `screencapture` writes the finished PNG within ~35 ms of the capture and then
-**blocks on a synchronous Spotlight (`mds`) call with a 10-second timeout** before it renames the
-file into its final name — the poll only matches the final name, so in 4.6 % of shots the clipboard
-and thumbnail wait ≥ 1 s and in 1.1 % exactly 10 s, on a machine whose Spotlight server is kept
-busy by the Claude fleet. (3) Hammerspoon's own contribution after the rename is small but not
+**blocks on a synchronous Spotlight (`mds`) call — `MDItemSetAttributes`, and the block is
+UNBOUNDED** — before it renames the file into its final name. The poll only matches the final name,
+so in 4.6 % of shots the clipboard and thumbnail wait ≥ 1 s and in 1.1 % around 10 s, on a machine
+whose Spotlight server is kept busy by the Claude fleet. **The 10 s is `mds`'s head-of-queue
+watchdog, not a ceiling on the wait** (K1 mechanism refuter, 80 %): 13.7 s and 29.4 s have been
+observed, so no 10 s assumption survives anywhere in the design. (3) Hammerspoon's own contribution after the rename is small but not
 100th-percentile: a 50 ms poll quantum, a 7 ms listing of 3,374 entries, a 55 ms TIFF re-encode of
 a big capture, a synchronous python3 spawn on every Dock change, and a 250 ms slide-in.
 
@@ -115,7 +117,7 @@ the file's birth time (birth = capture + ~30 ms).
   not pid); the IPC port is the cheap single-instance detector; nothing may run unguarded before
   the modules start.
 
-### F2 — Apple stalls up to 10 s on Spotlight AFTER the PNG is complete (latency class A)
+### F2 — Apple stalls on Spotlight AFTER the PNG is complete, for an unbounded time (latency class A)
 
 The unified log of the 23:59:59 capture (pid 85239), with the file's own timestamps:
 
@@ -164,10 +166,12 @@ The unified log of the 23:59:59 capture (pid 85239), with the file's own timesta
   `<dir>/..<name>.png-XXXX` (partial, no IEND at any of 50 observed intermediate sizes), then
   atomically renames it to `<dir>/.<name>.png` — **already complete at its first appearance**
   (same inode, same sha256, mtime fixed) — then screencapture calls `MDItemCreate`/`SetAttributes`
-  (the `mds` XPC that can stall 10 s) and only afterwards renames it to `<name>.png`. The current
+  (the `mds` XPC that stalls — specifically `MDItemSetAttributes`, K1) and only afterwards renames
+  it to `<name>.png`. The current
   matcher (`^Screenshot…png$`) ignores both hidden names, so the pipeline waits for Apple. The gain
   from reading the hidden file equals the rename delay: median 5–10 ms, ≥ 1 s in 4.6 % of shots,
-  ~10 s in the 1 % that hit the timeout. The single-dot file is visible for ≥ 50 ms in only 18 % of
+  ~10 s in the 1 % that hit `mds`'s watchdog — and longer still when it does not fire (13.7 s, 29.4 s
+  observed), which is why the Phase 2 cap is 30 s rather than 10 s. The single-dot file is visible for ≥ 50 ms in only 18 % of
   shots (median 11 ms), so a **path-based** reader can hit ENOENT between two polls — a miss, never
   a wrong image. The remedy is to open the file handle once at detection (a handle survives both
   renames) and re-resolve by inode on ENOENT. Keyboard-path temp spelling was observed live in
@@ -388,7 +392,7 @@ collected in this session, and the plan's bench (Phase 5) re-measures each one a
 | # | failure | today | after the plan |
 |---|---|---|---|
 | 1 | Hammerspoon not running (killed / quit / crashed) | silent; fallback copies PNG only, late, and loses rapid or stalled shots | launchd KeepAlive restarts in < 1 s; bounded retroactive copy at arm; fallback retired |
-| 2 | Apple's post-write Spotlight stall (≤ 10 s) | clipboard + thumbnail wait for the rename | copy from the dotfile temp on IEND; the stall no longer reaches the user |
+| 2 | Apple's post-write Spotlight stall (**unbounded** — 10 s is `mds`'s watchdog, not a ceiling; 13.7 s and 29.4 s observed) | clipboard + thumbnail wait for the rename | copy from the dotfile temp on IEND; the stall no longer reaches the user |
 | 3 | Rename lands between settle polls (dotfile design only) | n/a | inode recorded on verified copy; "gone" re-resolves by inode |
 | 4 | Main thread blocked (python Dock rebind, TIFF encode, hot rescans) | poll and tap stall; tap can be disabled by timeout | native plist read; PNG-only write; no hot rescans; nothing synchronous on the poll path |
 | 5 | 50 ms poll quantum + 7 ms listing | 29 ms median, 112 ms max after the rename | 10 ms poll; listing only on a size change |
