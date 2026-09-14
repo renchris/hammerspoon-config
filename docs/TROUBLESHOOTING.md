@@ -18,14 +18,23 @@ silence" below. Detection is now a directory poll, so what remains is mundane:
 `~/Screenshots` missing, Hammerspoon not running, or the config failed to load.
 
 **Fix**:
-1. Read the pipeline log — every screenshot leaves a `detected` and a `copied` line:
-   `tail -n 20 ~/Library/Logs/Hammerspoon/screenshot.log`
-   - No `detected` line: the poll never saw the file. Check `ls ~/Screenshots` exists and
-     `hs -c 'return screenshotPollTimer:running()'` prints `true`; otherwise reload.
-   - `detected` but no `copied`: a `W`/`E` line on the next row says why (gave up waiting
-     for a complete PNG, clipboard write failed).
-2. Reload Hammerspoon: `hs -c 'hs.reload()'` (the log gets a fresh `poll armed` line).
-3. Check the console for a Lua error: Hammerspoon > Console.
+1. Read the pipeline log. Every screenshot leaves one logfmt line per phase, joined by
+   `id=` — six hex characters of the file's inode:
+   `tail -n 30 ~/Library/Logs/Hammerspoon/screenshot.log`
+   - **No `created` line at all**: the poll never saw the file. Check that `~/Screenshots`
+     exists, then `hs -c 'return hs.inspect(hsc("screenshot"))'` — `started` must be true
+     and `watcher.ticks` must be climbing between two calls. Otherwise reload.
+   - **`created` but no `copied`**: look for `phase=lost` with its `reason=` (`settle-timeout`,
+     `clipboard`, `unreadable`, `deleted`), or `phase=gone reason=not-png` — the entry was
+     something other than a screenshot.
+   - **`copied` then `clobbered`**: the write was verified and then another app took the
+     clipboard. See "⌘V pastes the wrong thing" below.
+   - **Neither `copied` nor `lost`**: the pipeline was not running when the shot was taken.
+     That is the one failure the log cannot narrate, and it is why supervision matters.
+2. Reload Hammerspoon: `hs -c 'hs.reload()'` (the log gets a fresh `phase=armed` line carrying
+   both `entries=` and `expect=`, which must agree — see "The armed line says invariant=BROKEN").
+3. Check the console for a Lua error: Hammerspoon > Console. A module that failed to load left
+   a `phase=error` line naming itself.
 
 ## Screenshots dropped in silence (FSEvents stalled) — fixed 2026-09-08
 
@@ -99,13 +108,25 @@ Dictation tools (VoiceInk, Wispr Flow) also write the clipboard around a dictati
 
 **Symptom**: Screenshot is copied to clipboard but no floating thumbnail slides in.
 
-**Cause**: The canvas object or its timers may have been garbage collected. With more than
-one display, first check the other screen: the thumbnail slides in on the display under the
-mouse pointer (where the selection was just drawn), not on the display holding the focused
-window.
+**Cause**: with more than one display, first check the other screen — the thumbnail appears on
+the display under the **mouse pointer** (where the selection was just drawn), not on the display
+holding the focused window.
 
-**Fix**: Restart Hammerspoon. The reload cleanup guard ensures all stale objects
-are cleaned up before re-initialization.
+**Fix**: the log settles it without guessing. A `copied` line followed by `thumb-shown` and
+`thumb-visible` means the window server is presenting it somewhere:
+
+```bash
+grep -a 'phase=thumb' ~/Library/Logs/Hammerspoon/screenshot.log | tail -5
+```
+
+- `thumb-shown` carries `x=` `y=` `w=` `h=` — the canvas's actual frame. Compare it with
+  `hs -c 'return hs.inspect(hs.screen.allScreens())'`.
+- `thumb-shown` with no `thumb-visible` means `hs.canvas:isOccluded()` never went false: the
+  canvas is ordered in but off every display, or covered. (`isShowing()` is not an oracle for
+  this — it returns true for a canvas parked at 4000,4000.)
+- `warn … msg=no_thumbnail_(image_could_not_be_decoded)` means the copy succeeded and the decode
+  did not — the clipboard still has the image.
+- No `copied` line at all: this is the previous section, not a thumbnail problem.
 
 ## Thumbnail never goes away
 
@@ -135,11 +156,18 @@ hs -c 'hs.reload()'                 # or rebuild the Lua state
 ```
 
 **Diagnosing**: Hammerspoon's canvas windows are invisible to `hs.window`, so ask the window
-server. A ghost appears as `layer=3` + `onscreen=true` while every Lua global is `nil`:
+server — and ask it *geometrically*, because `kCGWindowIsOnscreen` means "ordered in", not "on a
+display": a canvas at (4000,4000) reports `onscreen=true`. The bench's prober already does this:
 
 ```bash
-hs -c 'return tostring(thumbCanvas)'    # nil, yet a thumbnail is on screen => orphan
+printf 'probe\nquit\n' | bench/winprobe
+# {"visible":true,"frac":1.0,"n":1,"bounds":[1356,703,352,276]}  -- a thumbnail is really up
+# {"visible":false,"frac":0,"n":0,"bounds":[]}                   -- nothing is up
 ```
+
+`n` is how many `layer=3` Hammerspoon windows exist; more than one after the dismissal has run
+is an orphan. `hs -c 'return hs.inspect(hsc("screenshot").screenshot.thumbnail)'` reports whether the
+module thinks one is visible, which is the other half of the answer.
 
 ## Clicking a thumbnail replaces the clipboard with an old screenshot
 
@@ -153,28 +181,111 @@ write a `com.apple.quarantine` xattr to it, which re-triggered the watcher. The 
 remembered only the single most recent path, so once any other screenshot had copied in
 between, the stale re-delivery sailed through and was copied again in full.
 
-**Fix**: the dedup is keyed on file identity (`size:mtime`) recorded at copy time. An xattr
-write changes neither, so an unchanged file is ignored; only genuine content changes
-re-trigger a copy.
+**Fix (2026-09-08)**: the dedup was keyed on file identity (`size:mtime`) recorded at copy time.
+An xattr write changes neither, so an unchanged file was ignored.
+
+**Fix (current)**: there is no event stream at all — detection is a poll — and the dedup is keyed
+on the **inode**, recorded on the *verified copy* and never at detection. A second appearance of
+a known inode is treated as what it is, a rename: the recorded path is re-pointed and nothing is
+copied again. Recording the inode at detection instead would make the final name look like a
+duplicate of the hidden one and drop the shot silently, which is why the order matters.
 
 ## Cmd+Shift+3/4 feels slow
 
-**Symptom**: There's a ~100ms delay between the screenshot capture and the
-clipboard copy / thumbnail.
+**Symptom**: seconds pass between the capture and the clipboard or thumbnail.
 
-**Cause**: This is expected. The pipeline is:
-1. macOS captures the screenshot and renames the finished PNG into `~/Screenshots` (~50ms)
-2. The 50 ms directory poll notices the new entry (≤ 50 ms + ~8 ms listing)
-3. Hammerspoon reads, copies, verifies (~25 ms measured; `settled Nms` in the log)
+**Cause, before 2026-09-13**: Apple. `screencapture` writes a complete PNG under a hidden name,
+then makes an unconditional Spotlight round trip (`MDItemCreate` → `MDItemSetAttributes`), and
+only *then* renames the file to its final name. The old matcher waited for that final name, so it
+inherited the whole stall: p90 225 ms, p99 about 10 s, with 13.7 s and 29.4 s observed. No
+preference, directory exclusion or flag removes it — the call is unguarded straight-line code
+with no branch to take.
 
-The native macOS thumbnail also has a similar delay — it just hides it with animation.
+**Cause, after 2026-09-13**: nothing should. The pipeline copies from the hidden name, so the
+stall is off the path entirely; `phase=renamed` routinely lands *seconds after* `phase=copied`,
+which is the design working. What remains is 10 ms of poll, a few hundred microseconds of read,
+and 3–19 ms of pasteboard.
 
-Under heavy load the long pole is macOS's own `screencapture` process, not Hammerspoon:
-measured 2026-09-08 at load average 223, `screencapture` took anywhere from 0.3 s to 10 s
-to produce the file, while the poll-to-clipboard part stayed under 100 ms. An in-process
-`hs.screen:snapshot()` took 33–86 ms on the same box, so a Hammerspoon-native capture would
-remove that tail — but it would also replace the system crosshair UI (magnifier, space for
-window mode), so it has not been done.
+**Diagnosing**: the `copied` line carries its own breakdown.
+
+```bash
+grep -a 'phase=copied' ~/Library/Logs/Hammerspoon/screenshot.log | tail -5
+#   dt=           ns from first sight to a verified clipboard
+#   read_ns=      reading the PNG through the open handle
+#   pb_write_ns=  hs.pasteboard.writeAllData on the general board
+#   pb_verify_ns= reading it back to prove the bytes landed
+```
+
+A large `pb_write_ns` is the machine's own clipboard observers being notified: the same write to
+a *private* pasteboard is 0.43 ms for 351 KB, against 3–19 ms on the general board.
+
+**If it is still slow**, the remaining suspect is a main-thread stall, and a stall is never made
+up: CFRunLoopTimer coalesces missed fires rather than catching up, so detection inside a stall of
+duration *D* costs `D + one scan`. Nothing is lost; it is purely latency. Compare `watcher.ticks`
+across two seconds — it should climb by about 100 per second:
+
+```bash
+hs -c 'return hsc("screenshot").screenshot.watcher.ticks'; sleep 1
+hs -c 'return hsc("screenshot").screenshot.watcher.ticks'
+```
+
+## ⌘V pastes the wrong thing after a screenshot
+
+**Symptom**: the log says `copied`, but ⌘V pastes text, or an older image.
+
+**Cause**: another application wrote the clipboard after we did. This box runs at least one
+dictation tool that snapshots and restores the pasteboard around its own work, and a clipboard
+manager will do the same.
+
+**Fix**: the pipeline re-checks `changeCount` 300 ms after its verified write and logs
+`phase=clobbered` with both counts when it moved and we did not move it. So the question is
+answerable rather than mysterious:
+
+```bash
+grep -a 'phase=clobbered' ~/Library/Logs/Hammerspoon/screenshot.log | tail -5
+```
+
+There is no fix inside this config — whoever wrote last wins — but the line names the failure
+instead of letting the 7-day acceptance score it a success.
+
+## A hidden `.Screenshot …` file is left in ~/Screenshots
+
+**Symptom**: `ls -a ~/Screenshots` shows entries starting with a dot, or with a `-XXXX` suffix.
+
+**Cause**: `screencapture` was killed between finishing the PNG and renaming it — the window
+where it sits inside Apple's Spotlight call, which can last tens of seconds.
+
+**Fix**: the pipeline un-hides it itself, 30 s after first sight, once no `screencapture` process
+is alive and only if the file is a *complete* PNG (an incomplete one is left alone rather than
+given a name it does not deserve). Look for `phase=stranded`. A dotfile older than that with no
+`stranded` line was created while the pipeline was not running; rename it by hand.
+
+## The armed line says `invariant=BROKEN`
+
+**Symptom**: `phase=armed … entries=3423 expect=3421 invariant=BROKEN`.
+
+**Cause**: the reconcile loop terminates early when the directory's name count agrees with
+`st_size/32`. On this volume they agree exactly — `hs.fs.dir` yields `.` and `..`, which is why
+the count matches `size/32` and not `size/32 − 2` as POSIX `listdir` would. A filesystem that
+reports directory sizes differently breaks that equality.
+
+**Fix**: nothing to do. The watcher detects this at arm, says so, and falls back to running the
+reconcile loop for its full 10-tick bound after every size change. Correct either way, just less
+frugal: about 24 ms of extra listing per size change instead of one.
+
+## The bench refuses to run
+
+**Symptom**: `ABORT: operator present (idle 12s < 180s required)`, or
+`ABORT: multi-item pasteboard; refusing to run`.
+
+**Cause**: both are deliberate. The bench captures the live desk and owns the general pasteboard
+for the duration, so it will not start while somebody is using the machine; and a multi-item
+clipboard cannot be restored faithfully (only the first item survives a round trip), so it
+refuses to touch one rather than destroy it.
+
+**Fix**: leave the machine alone for three minutes, or copy something ordinary first. `--quick N`
+uses the same gate on purpose. If `swiftc` is missing, install the Command Line Tools — the
+prober is the bench's only native dependency.
 
 ## Can't remap Cmd+Shift+3/4
 
@@ -192,14 +303,20 @@ intercept or modify the capture behavior itself.
 
 **Symptom**: Cmd+V in iTerm2/Kitty pastes text normally instead of converting to Ctrl+V for image paste.
 
-**Cause**: Either Accessibility permission is missing (eventtap requires it), or your terminal
-app is not in the `terminalApps` table in `init.lua`.
+**Cause**: either Accessibility permission is missing (eventtap requires it), or your terminal's
+**bundle id** is not in `hsc/apps.lua`.
 
 **Fix**:
-1. Verify Accessibility permission (System Settings > Privacy & Security > Accessibility)
-2. Check that your terminal's name matches exactly: iTerm2, Kitty, Terminal, or WezTerm
-3. For other terminals, add them to the `terminalApps` table in `init.lua`
+1. Verify Accessibility permission (System Settings > Privacy & Security > Accessibility).
+2. Get the bundle id — never the display name:
+   `hs -c 'return hs.application.frontmostApplication():bundleID()'`
+3. Add it to `M.terminals` in `hsc/apps.lua`. The table was name-keyed until 2026-07-31 and
+   silently missed kitty, whose `CFBundleName` is lowercase `kitty`; both features that read it
+   were dead there while working in iTerm2 by the accident of its name matching exactly.
 
+Note that the tap **self-heals**: `libeventtap.m` re-enables on both
+`kCGEventTapDisabledByTimeout` and `…ByUserInput`, so a long main-thread stall drops events
+during it but never leaves the tap permanently dead.
 ## Hammerspoon is supervised by launchd (since 2026-09-13)
 
 **What changed**: Hammerspoon is no longer a Login Item. The user agent
