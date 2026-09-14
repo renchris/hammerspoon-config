@@ -182,3 +182,39 @@ app is not in the `terminalApps` table in `init.lua`.
 1. Verify Accessibility permission (System Settings > Privacy & Security > Accessibility)
 2. Check that your terminal's name matches exactly: iTerm2, Kitty, Terminal, or WezTerm
 3. For other terminals, add them to the `terminalApps` table in `init.lua`
+
+## Hammerspoon is supervised by launchd (since 2026-09-13)
+
+**What changed**: Hammerspoon is no longer a Login Item. The user agent
+`org.hammerspoon.Hammerspoon.keepalive` (`launchd/…keepalive.plist`, installed by
+`scripts/supervise.sh install`) starts it at login and restarts it the moment it dies — measured
+**respawn 49 ms** after a SIGTERM and the screenshot watcher re-armed **565 ms** after the kill.
+Before this, a fleet script SIGTERMed it on 2026-09-09 and nothing restarted it for 5.4 h.
+Sparkle's auto-update is off (`SUAutomaticallyUpdate=0`), so only launchd ever starts it.
+
+**Is it healthy?** `bash scripts/supervise.sh status` — one fact per line, `verdict=supervised`
+and exit 0 only when: the job is loaded from the repo's plist, exactly one Hammerspoon runs and it
+is launchd's, the watcher logged an `armed` line since that process started, the Login Item is
+gone, and Sparkle auto-update is off. It reads the **log heartbeat, never just a pid** — on
+2026-09-10 a live-looking pid was a zombie whose config never loaded.
+
+**Prove the restart works**: `bash scripts/supervise.sh --prove` (kills it on purpose; prints
+`respawn N ms` and the detector downtime; exit 0 = pass, N < 2000).
+
+**Symptoms and fixes**:
+- *Quitting from the menu bar does nothing* — correct: under KeepAlive a quit is a restart. To
+  stop it for real: `bash scripts/supervise.sh uninstall` (restores the Login Item and Sparkle
+  setting exactly as they were before install and relaunches it unsupervised; `--no-launch` leaves
+  it stopped).
+- *Two Hammerspoon processes* (`pgrep -x Hammerspoon | wc -l` > 1) — something launched one outside
+  launchd (the Login Item re-added, a manual binary exec). `status` names it; quit the one that is not
+  `job_pid`. 🚨 Never run `/Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon` directly, not
+  even with `--version` — it ignores argv and starts a second instance.
+- *It relaunches every ~10 s* — a start-up crash loop (launchd's default throttle). `status` shows
+  `launchd_runs` climbing with a young `age_s`; read `launchd_last_exit_code` /
+  `launchd_last_terminating_signal`, then Hammerspoon > Console or the crash report.
+- *Updating Hammerspoon* — use the Hammerspoon menu (Check for Updates). Afterwards run `status`:
+  it must still say one instance.
+- *A permission looks lost* — `install` asserts Accessibility, Screen Recording and `hs.eventtap`
+  on the launchd-started instance **before** it removes the Login Item, and rolls back if any is
+  missing; grants are keyed to the signed bundle, so the launch path does not change them.
