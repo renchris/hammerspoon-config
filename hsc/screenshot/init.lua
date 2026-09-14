@@ -1,0 +1,385 @@
+-- hsc/screenshot — ⌘⇧4 capture → clipboard → thumbnail, with the dotfile as the file.
+--
+-- THE ONE IDEA.  `screencapture` writes a COMPLETE PNG under a hidden name, then calls
+-- MDItemCreate/MDItemSetAttributes — an unconditional, unguarded Spotlight round trip with no
+-- branch to take (B2, disassembly at 0x1000192b4) — and only THEN renames the file to its final
+-- name.  That stall is UNBOUNDED: 13.7 s and 29.4 s observed, and the "10 s" in the folklore is
+-- mds's per-message watchdog, not a bound.  A watcher keyed on the final name pays all of it; a
+-- watcher keyed on the hidden name pays none of it.  Everything else here follows from that.
+--
+-- THE ORDER OF OPERATIONS IS ITSELF A DESIGN DECISION, measured end to end:
+--     poll (10 ms, st_size only) → open the handle at first sight → settle to IEND through the
+--     handle → read the bytes → VERIFIED PNG-only pasteboard write → record the inode as copied →
+--     decode → thumbnail → Pop.
+-- The clipboard is reached BEFORE any hs.image decode, because the PNG bytes need no decode to be
+-- pasteable and the decode is ~47 ms for a 2.4 MB capture at 2× (E1 §5) — decoding first delayed
+-- every large shot's ⌘V for nothing.  The inode is recorded as copied only AFTER the write is
+-- verified, because recording it at detection would make the final name look like a duplicate and
+-- silently drop the shot (hostile review item 1).
+local clock     = require("hsc.clock")
+local log       = require("hsc.log")
+local watcher   = require("hsc.screenshot.watcher")
+local settle    = require("hsc.screenshot.settle")
+local clipboard = require("hsc.screenshot.clipboard")
+local thumbnail = require("hsc.screenshot.thumbnail")
+
+local M = {}
+
+local cfg = {
+  dir            = os.getenv("HOME") .. "/Screenshots",
+  pollS          = 0.010,   -- C1: first-name detection p50 4.7 / p90 10.0 / p99 11.1 ms, 35/35 caught
+  backstopS      = 1.0,     -- the net-zero-tick backstop; one listing/s, 2.4 ms, ~0.24 % of a core
+  reconcileMax   = 10,      -- bound on the re-list loop after a size change
+  creationWindow = 30,      -- a candidate must have been created within this many seconds
+  retroWindow    = 15,      -- at arm, copy anything this fresh that has no `copied` record yet
+  settleCapS     = 30,      -- the stall is unbounded; 30 s is a give-up, not a model of Apple
+  strandedAfterS = 30,      -- un-hide a dotfile screencapture abandoned mid-stall
+  clobberAfterS  = 0.3,     -- re-check changeCount: did another app take the clipboard from us?
+  copiedTTLS     = 120,     -- how long an inode stays in the dedup table
+  tiff           = os.getenv("SCREENSHOT_TIFF") == "true",
+}
+
+local state = {
+  timer = nil, w = nil, started = false,
+  pending = {},          -- ino -> candidate
+  copied  = {},          -- ino -> { path, file, t }  (dedup, recorded on VERIFIED copy only)
+  counts  = { created = 0, copied = 0, lost = 0, gone = 0, renamed = 0, notpng = 0 },
+  startedNs = 0,
+}
+
+-- ---------------------------------------------------------------------------------------------
+-- Path resolution by inode.  E1 §7: strip the leading dot(s) and make ONE inode check — never scan
+-- the directory.  A screenshot's three names differ only by that prefix, so this resolves any of
+-- them to whichever one exists right now.
+-- ---------------------------------------------------------------------------------------------
+local function resolvePath(ino, hint)
+  local rec = state.copied[ino] or state.pending[ino]
+  local candidates = {}
+  if hint then candidates[#candidates + 1] = hint end
+  if rec and rec.path then candidates[#candidates + 1] = rec.path end
+  for _, p in ipairs({ candidates[1], candidates[2] }) do
+    if p then
+      local a = hs.fs.attributes(p)
+      if a and a.ino == ino then return p end
+      local dir, base = p:match("(.*)/([^/]+)$")
+      if dir and base then
+        local undotted = base:gsub("^%.+", "")
+        if undotted ~= base then
+          local p2 = dir .. "/" .. undotted
+          local a2 = hs.fs.attributes(p2)
+          if a2 and a2.ino == ino then return p2 end
+        end
+      end
+    end
+  end
+  return nil
+end
+M.resolve = function(ino) return resolvePath(ino) end
+
+-- ---------------------------------------------------------------------------------------------
+-- Stranded dotfile: screencapture was killed between the PNG and the rename, so the user's archive
+-- holds a hidden file forever.  We already have the bytes; give the file its name back.  The
+-- liveness test is an hs.task — NEVER hs.execute, which is io.popen + read('*a') + close(), a
+-- synchronous fork/exec/waitpid WITH NO TIMEOUT AT ALL (F2: median 43 ms, worst case unbounded —
+-- a hung /usr/bin/python3 hangs Hammerspoon's main thread forever).
+-- ---------------------------------------------------------------------------------------------
+local function armStrandedCheck(ino, id)
+  hs.timer.doAfter(cfg.strandedAfterS, function()
+    local p = resolvePath(ino)
+    if not p then return end
+    local dir, base = p:match("(.*)/([^/]+)$")
+    if not base or not base:match("^%.") then return end   -- already renamed by Apple; nothing to do
+    hs.task.new("/usr/bin/pgrep", function(rc)
+      if rc == 0 then return end                            -- screencapture still alive; let it finish
+      local final = dir .. "/" .. base:gsub("^%.+", "")
+      if hs.fs.attributes(final) then return end
+      local ok = os.rename(p, final)
+      log.emit("stranded", { id = id, renamed = ok and 1 or 0, file = final:match("[^/]+$") })
+    end, { "-x", "screencapture" }):start()
+  end)
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Detection
+-- ---------------------------------------------------------------------------------------------
+local function release(rec, phase, extra)
+  if rec.fh then pcall(function() rec.fh:close() end); rec.fh = nil end
+  state.pending[rec.ino] = nil
+  if phase then
+    local f = extra or {}
+    f.id, f.dt, f.file = rec.id, clock.mono() - rec.createdNs, rec.file
+    log.emit(phase, f)
+    state.counts[phase] = (state.counts[phase] or 0) + 1
+  end
+end
+
+local function onCandidate(c)
+  local ino = c.attrs.ino
+
+  -- The same inode under a new name is a RENAME, not a new shot.  Because the settle reads through
+  -- an open handle, a rename between polls costs nothing: re-point the path and move on.
+  local known = state.copied[ino] or state.pending[ino]
+  if known then
+    if known.path ~= c.path then
+      known.path, known.file = c.path, c.name
+      state.counts.renamed = state.counts.renamed + 1
+      log.emit("renamed", { id = log.id(ino), file = c.name })
+    end
+    return
+  end
+
+  -- The creation window is what makes name-matching unnecessary: a Finder duplicate of an old
+  -- screenshot ("Screenshot … copy.png") and a sync client's churn are both old, and would
+  -- otherwise hijack the clipboard (hostile review item 7).
+  local age = os.time() - (c.attrs.creation or 0)
+  if age < 0 then age = 0 end
+  if age > cfg.creationWindow then return end
+
+  -- Open the handle IMMEDIATELY and keep it: the single-dot name is visible for ≥ 50 ms in only
+  -- 18 % of shots.  ENOENT here means the name moved under us between the listing and the open —
+  -- the next listing finds the same inode under its new name, which is a miss of one tick, never a
+  -- lost shot.
+  local fh = io.open(c.path, "rb")
+  if not fh then return end
+
+  local rec = {
+    ino = ino, id = log.id(ino), path = c.path, file = c.name, fh = fh,
+    createdNs = clock.mono(),          -- hs.fs truncates to whole seconds; THIS is the timestamp
+    seq = clipboard.nextSeq(),
+    size = 0, isPng = false, settlingLogged = false,
+  }
+  state.pending[ino] = rec
+  state.counts.created = state.counts.created + 1
+  log.emit("created", { id = rec.id, size = c.attrs.size or 0, retro = c.retro, file = c.name })
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Completion
+-- ---------------------------------------------------------------------------------------------
+local function finish(rec)
+  log.emit("capture-complete", { id = rec.id, dt = clock.mono() - rec.createdNs,
+                                 bytes = rec.size, file = rec.file })
+
+  local data = settle.readAll(rec)
+  if not data then
+    release(rec, "lost", { reason = "unreadable" })
+    return
+  end
+
+  local ok, info = clipboard.write(data, rec.seq)
+  if not ok then
+    log.error("clipboard", { id = rec.id, msg = "write not verified", cc = info.cc,
+                             readback = info.readback, file = rec.file })
+    release(rec, "lost", { reason = "clipboard" })
+    return
+  end
+
+  -- Recorded HERE — on a verified copy — and nowhere earlier.
+  state.copied[rec.ino] = { path = rec.path, file = rec.file, t = clock.mono() }
+  state.counts.copied = state.counts.copied + 1
+  log.emit("copied", { id = rec.id, dt = clock.mono() - rec.createdNs, bytes = #data,
+                       cc = info.cc, seq = rec.seq, retried = info.retried, file = rec.file })
+  clipboard.watchForClobber(info.cc, rec.id, rec.file, cfg.clobberAfterS)
+
+  -- Only now does anything decode the image.
+  local shown = false
+  local path = resolvePath(rec.ino, rec.path)
+  if path then
+    local img = hs.image.imageFromPath(path)
+    if img then
+      shown = thumbnail.show({ ino = rec.ino, id = rec.id, path = path, file = rec.file,
+                               createdNs = rec.createdNs }, img)
+      if cfg.tiff then clipboard.writeTiffLater(data, img) end
+    end
+  end
+  if not shown then
+    log.warn("thumb", { id = rec.id, msg = "no thumbnail (image could not be decoded)", file = rec.file })
+  end
+
+  armStrandedCheck(rec.ino, rec.id)
+  release(rec, nil)
+end
+
+local function settleTick()
+  local done = nil
+  for ino, rec in pairs(state.pending) do
+    local status = settle.step(rec)
+    if status == "complete" then
+      done = done or {}
+      done[#done + 1] = rec
+    elseif status == "notpng" then
+      state.counts.notpng = state.counts.notpng + 1
+      release(rec, "gone", { reason = "not-png" })
+    elseif status == "gone" then
+      release(rec, "gone", { reason = "handle" })
+    else
+      if not rec.settlingLogged and clock.sSince(rec.createdNs) > 0.05 then
+        rec.settlingLogged = true
+        log.emit("settling", { id = rec.id, dt = clock.mono() - rec.createdNs,
+                               bytes = rec.size, file = rec.file })
+      end
+      -- 🚨 `lost` is a POSITIVE RECORD.  A shot that simply stops being mentioned is invisible to
+      -- the 7-day acceptance; a deadline that emits a line is falsifiable.
+      if clock.sSince(rec.createdNs) >= cfg.settleCapS then
+        local reason = resolvePath(ino) and "settle-timeout" or "deleted"
+        state.counts.lost = state.counts.lost + 1
+        release(rec, "lost", { reason = reason, bytes = rec.size })
+        armStrandedCheck(ino, rec.id)
+      end
+    end
+  end
+  if not done then return end
+  -- Ascending write sequence, so when two shots settle in the same tick the LATER capture is the
+  -- one left on the clipboard (F1 acceptance L3).
+  table.sort(done, function(a, b) return a.seq < b.seq end)
+  for _, rec in ipairs(done) do finish(rec) end
+end
+
+local function pruneCopied()
+  local now = clock.mono()
+  local ttl = cfg.copiedTTLS * 1e9
+  for ino, rec in pairs(state.copied) do
+    if (now - rec.t) > ttl then state.copied[ino] = nil end
+  end
+end
+
+-- ---------------------------------------------------------------------------------------------
+-- Arm / start / stop
+-- ---------------------------------------------------------------------------------------------
+
+--- Inodes a PREVIOUS instance already copied, read back from the log's tail.  Bounded retroactivity
+--- must not re-copy a shot the dead instance had already put on the clipboard.
+local function recentlyCopiedIds()
+  local ids = {}
+  local st = log.stats()
+  if not st.path then return ids end
+  local fh = io.open(st.path, "rb")
+  if not fh then return ids end
+  local size = fh:seek("end")
+  fh:seek("set", math.max(0, size - 64 * 1024))
+  local tail = fh:read("*a") or ""
+  fh:close()
+  for line in tail:gmatch("[^\n]+") do
+    if line:find("phase=copied", 1, true) then
+      local id = line:match("id=(%x+)")
+      if id then ids[id] = true end
+    end
+  end
+  return ids
+end
+
+--- ⌘⇧5 and the floating thumbnail are live modalities on this box (`video = 1` in the defaults), and
+--- their writer is `screencaptureui`, not `/usr/sbin/screencapture`.  Turning `show-thumbnail` on
+--- adds a SECOND, user-paced move that this module's settle assumptions have never been validated
+--- against, and `target` anything but `file` means no file is written at all.  So: read them, and
+--- WARN rather than pretend (completeness critic item 7).  Asynchronous, at start, off every path.
+local function checkCaptureDefaults()
+  hs.task.new("/usr/bin/defaults", function(rc, out)
+    if rc ~= 0 or not out then return end
+    local thumb  = out:match('"?show%-thumbnail"?%s*=%s*([^;]+);')
+    local target = out:match('"?target"?%s*=%s*([^;]+);')
+    thumb  = thumb  and thumb:gsub("%s", "")  or "unset"
+    target = target and target:gsub("%s", "") or "unset"
+    if thumb ~= "0" and thumb ~= "unset" then
+      log.warn("defaults", { msg = "show-thumbnail is on; screencaptureui adds a user-paced second move",
+                             ["show-thumbnail"] = thumb })
+    end
+    if target ~= "file" and target ~= "unset" then
+      log.warn("defaults", { msg = "capture target is not a file; no file means no thumbnail",
+                             target = target })
+    end
+  end, { "read", "com.apple.screencapture" }):start()
+end
+
+--- Warm the lazy modules ONCE, at load.  hs.mouse/hs.screen/hs.sound/hs.canvas are otherwise first
+--- touched inside the settle path, so the FIRST screenshot after every Hammerspoon launch pays
+--- ~20–40 ms of module loading on the user's latency path — and this box relaunches often (F2 §9).
+local function warmModules()
+  pcall(function()
+    hs.mouse.absolutePosition()
+    hs.screen.allScreens()
+    hs.sound.getByName("Pop")
+    local c = hs.canvas.new({ x = 0, y = 0, w = 1, h = 1 })
+    if c then c:delete() end
+    hs.image.imageFromName("NSApplicationIcon")
+  end)
+end
+
+function M.start(userCfg)
+  if state.started then return true end
+  for k, v in pairs(userCfg or {}) do cfg[k] = v end
+  state.startedNs = clock.mono()
+
+  warmModules()
+  thumbnail.start({ resolve = M.resolve })
+
+  state.w = watcher.new({
+    dir = cfg.dir, reconcileMax = cfg.reconcileMax, backstopS = cfg.backstopS,
+    onCandidate = onCandidate,
+  })
+  state.w:arm(cfg.retroWindow, recentlyCopiedIds())
+
+  -- continueOnError = true.  hs.timer.new defaults to STOPPING the timer on the first Lua error in
+  -- its callback, which would turn a transient fault into a silent, permanent loss of detection —
+  -- the exact failure shape this rewrite exists to remove.
+  state.timer = hs.timer.new(cfg.pollS, function()
+    local ok, err = pcall(function()
+      if state.w then state.w:tick() end
+      settleTick()
+    end)
+    if not ok then log.error("tick", { msg = tostring(err) }) end
+  end, true)
+  state.timer:start()
+
+  -- Once a minute is plenty for a 120 s TTL, and it keeps the 10 ms tick free of housekeeping.
+  state.pruneTimer = hs.timer.doEvery(60, function() pcall(pruneCopied) end)
+
+  checkCaptureDefaults()
+  state.started = true
+  log.emit("start", { module = "screenshot", poll_ms = cfg.pollS * 1000,
+                      backstop_s = cfg.backstopS, cap_s = cfg.settleCapS, dir = cfg.dir })
+  return true
+end
+
+function M.stop()
+  if state.timer then state.timer:stop(); state.timer = nil end
+  if state.pruneTimer then state.pruneTimer:stop(); state.pruneTimer = nil end
+  for _, rec in pairs(state.pending) do
+    if rec.fh then pcall(function() rec.fh:close() end) end
+  end
+  state.pending = {}
+  thumbnail.stop()
+  state.w = nil
+  if state.started then log.emit("stop", { module = "screenshot" }) end
+  state.started = false
+end
+
+--- Bench mode: no sound, a short dismissal.  `analyze.py` records the mode and never compares
+--- percentiles across modes.
+function M.benchMode(on)
+  thumbnail.start({ config = on and { sound = false, dismiss = 0.4 }
+                               or { sound = true,  dismiss = 3 } })
+  return on and "bench" or "normal"
+end
+
+--- Drop a name from the watcher's mirror so it can be considered again (bench helper).
+function M.forget(name) if state.w then state.w:forget(name) end end
+
+function M.stats()
+  local pending, copied = 0, 0
+  for _ in pairs(state.pending) do pending = pending + 1 end
+  for _ in pairs(state.copied) do copied = copied + 1 end
+  return {
+    started = state.started,
+    uptime_s = state.started and clock.sSince(state.startedNs) or 0,
+    pending = pending, copied_tracked = copied,
+    counts = state.counts,
+    watcher = state.w and state.w:stats() or nil,
+    thumbnail = thumbnail.stats(),
+    log = log.stats(),
+    config = { poll_ms = cfg.pollS * 1000, backstop_s = cfg.backstopS, cap_s = cfg.settleCapS,
+               creation_window_s = cfg.creationWindow, retro_s = cfg.retroWindow, tiff = cfg.tiff },
+  }
+end
+
+return M
