@@ -273,6 +273,28 @@ reports directory sizes differently breaks that equality.
 reconcile loop for its full 10-tick bound after every size change. Correct either way, just less
 frugal: about 24 ms of extra listing per size change instead of one.
 
+## `phase=error … ipc.lua:81: ipc port is no longer valid` / `stack overflow`
+
+**Symptom**: a burst of `phase=error` lines whose message points at
+`hs/ipc.lua:81`, `hs/_coresetup.lua:26` or `hs/logger.lua:189`, clustered around reloads.
+
+**Cause**: `hs.ipc` REPLACES the global `print`, and its replacement RAISES when the IPC port is
+stale — which is what happens while Hammerspoon is tearing down for a reload with a `hs -c`
+connection in flight. Some extension internally prints, the replacement raises, formatting that
+error prints again, and the recursion is the stack overflow. Measured 2026-09-13: 42 such lines
+across a session of heavy `hs -c` use, **all of them inside reload windows and none during a
+14-minute unattended bench**, with zero screenshots lost in either.
+
+**Fix**: nothing to do, and the lines are the design working rather than failing. Two guards make
+this a log entry instead of an outage: the poll's callback runs inside a `pcall` and the timer is
+created with `continueOnError`, so the error is recorded and the next tick proceeds; and nothing in
+this config calls `print` or `hs.logger` at all, so the pipeline never *originates* one. The same
+mechanism, unguarded, is how the config died on 2026-09-10 at 12:03:36 — `EXC_BREAKPOINT` inside
+hs.ipc's logger, taking every feature with it.
+
+If you see these lines with NO reload nearby, that is different and worth reading: check
+`hs -c 'return hsc()._ipc'`, which is false when another instance owns the port.
+
 ## The bench refuses to run
 
 **Symptom**: `ABORT: operator present (idle 12s < 180s required)`, or

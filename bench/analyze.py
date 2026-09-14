@@ -63,10 +63,40 @@ def main():
     ap.add_argument("records")
     ap.add_argument("--md", default=None, help="write an acceptance document here")
     ap.add_argument("--listings-per-shot", type=float, default=None)
+    ap.add_argument("--log", default=None,
+                    help="backfill per-copy cost fields from the pipeline log, joined on id=. "
+                         "Useful for re-analysing a records file written before run.py captured "
+                         "them, and for reading an old run back after the fact.")
     args = ap.parse_args()
 
     data = json.load(open(args.records))
     recs = data["records"]
+
+    if args.log:
+        import re as _re
+        field = _re.compile(r"(\w[\w-]*)=(.*?)(?=\s+\w[\w-]*=|$)")
+        by_id = {}
+        try:
+            for line in open(args.log, errors="replace"):
+                row = dict(field.findall(line.strip()))
+                if row.get("phase") == "copied" and row.get("id"):
+                    by_id[row["id"]] = row
+        except OSError:
+            by_id = {}
+        filled = 0
+        for r in recs:
+            row = by_id.get(r.get("id"))
+            if not row:
+                continue
+            for k in ("read_ns", "pb_write_ns", "pb_verify_ns", "write_ns", "seq"):
+                if k not in r and k in row:
+                    try:
+                        r[k] = int(row[k])
+                        filled += 1
+                    except ValueError:
+                        pass
+        if filled:
+            print(f"[analyze] backfilled {filled} cost field(s) from {args.log}")
     n = len(recs)
 
     lost = [r for r in recs if r.get("outcome") in ("lost", "silent", "no-artifact")]
@@ -142,6 +172,18 @@ def main():
             table("capture-spawn → thumb-visible", spawn_vis),
             table("thumb-shown → thumb-visible", shown_vis),
         ]
+        # Where the milliseconds actually go, straight off the copied lines.
+        cost_rows = ["| component | n | p50 | p90 | p100 |", "|---|---|---|---|---|"]
+        for key, label in (("read_ns", "read the PNG through the open handle"),
+                           ("pb_write_ns", "hs.pasteboard.writeAllData (general board)"),
+                           ("pb_verify_ns", "readDataForUTI read-back (the L2 proof)")):
+            v = [r[key] for r in recs if isinstance(r.get(key), int)]
+            cost_rows.append("| {} | {} | {} | {} | {} |".format(
+                label, len(v),
+                f"{ms(pct(v,50)):.2f} ms" if v else "—",
+                f"{ms(pct(v,90)):.2f} ms" if v else "—",
+                f"{ms(pct(v,100)):.2f} ms" if v else "—"))
+
         bands = sorted({r.get("band") for r in recs if r.get("band")})
         band_rows = ["| band | n | png→copied p50 | p100 | median bytes |", "|---|---|---|---|---|"]
         for b in bands:
@@ -169,6 +211,10 @@ percentiles are never compared across modes.
 ## Percentiles (milliseconds)
 
 {chr(10).join(rows)}
+
+## Where the time goes
+
+{chr(10).join(cost_rows)}
 
 ## By capture size band
 

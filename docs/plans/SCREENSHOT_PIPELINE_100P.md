@@ -28,8 +28,10 @@ heading.
 **🚀 W1 + W3 LANDED 2026-09-13 (Phases 2, 3, 4, 5a, 5b).** `init.lua` is a loader; every feature is
 a module under `hsc/`; `bench/` and `scripts/screenshot-bench.sh` exist and run. Per-phase status
 lines are inline below, and § W1 acceptance record carries what the wave measured — including three
-findings that correct this document. W2 landed Phase 1 and Phase 6 in parallel, so **failure class A
-is closed too**, and the W1 acceptance run was measured under that supervision.
+findings that correct this document. W2 landed Phase 1 and Phase 6 in parallel (`88b99e9`,
+`9221631`, `6573e94`, `aa76097`, `4f44865`, `536aa35`, `26049e1` on `main`), so **failure class A is
+closed too**: `gui/501/org.hammerspoon.Hammerspoon.keepalive` is loaded, exactly one instance is
+running, and the W1 acceptance run below was measured under that supervision.
 
 **Targets (acceptance, all measured by the bench in Phase 5 and by 7 days of real use):**
 
@@ -613,6 +615,19 @@ in 11.12 ms through this path and a **warm** re-read of the same file in 2.96 ms
 genuinely have to come off the device and chunking only adds ~8 MB of garbage for the collector to
 walk at the worst possible moment.
 
+### A fourth finding, and it validates the rule it tested
+
+**`hs.ipc`'s replaced `print` raises, and it reaches the poll.** 42 `phase=error` lines appeared
+across this session, all of them inside reload windows and **none during the 14-minute unattended
+acceptance run**, with messages pointing at `hs/ipc.lua:81`, `hs/_coresetup.lua:26` and
+`hs/logger.lua:189` — a stale IPC port makes the replaced `print` raise, formatting that error
+prints again, and the recursion is the stack overflow. Zero screenshots were lost to any of them,
+because the poll's callback is inside a `pcall` and its timer carries `continueOnError`, and
+because nothing in this config calls `print` or `hs.logger` and so never originates one. This is
+the same mechanism that killed the config on 2026-09-10 at 12:03:36 (`EXC_BREAKPOINT` inside
+hs.ipc's logger) — unguarded there, contained here. The Phase 5a rule "no bare `print`; write
+through `hsc/log.lua`" is not stylistic.
+
 ### Invariants confirmed live
 
 - `phase=armed dir=… entries=3425 expect=3425 invariant=holds size=109600` — the **corrected**
@@ -627,12 +642,14 @@ walk at the worst possible moment.
 
 ### Still open after W1 + W3
 
-Critic items **1, 2, 6, 8 and 10** are untouched and owned by W2/W4/W5. Item **11** is partly
+Critic items **6, 8 and 10** are untouched and owned by W4/W5 (items 1 and 2 are W2's and it
+reports them closed on `main`). Item **11** is partly
 addressed — the bench samples a full-display capture every 20 iterations and `analyze.py` reports
 percentiles per size band — but the *base* band is now the pessimistic end of the distribution
 rather than the p85 image, because a locked screen's photographic wallpaper compresses to ~8 MB
-where a UI screenshot of the same geometry is ~2.4 MB. **Phase 1 and Phase 6 are not implemented**,
-so failure class A stands: nothing restarts Hammerspoon.
+where a UI screenshot of the same geometry is ~2.4 MB. Phase 1 and Phase 6 landed from W2 while this wave
+was running, so failure class A is no longer open — but nothing in W1 depends on that, and the
+acceptance numbers below were taken with supervision already live.
 
 ## Decision log (why, so a successor does not re-litigate)
 

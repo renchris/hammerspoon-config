@@ -252,7 +252,7 @@ local function settleTick()
       done = done or {}
       done[#done + 1] = rec
     elseif status == "notpng" then
-      state.counts.notpng = state.counts.notpng + 1
+      state.counts.notpng = state.counts.notpng + 1   -- a distinct key from `gone`, not a duplicate
       release(rec, "gone", { reason = "not-png" })
     elseif status == "gone" then
       release(rec, "gone", { reason = "handle" })
@@ -265,8 +265,8 @@ local function settleTick()
       -- 🚨 `lost` is a POSITIVE RECORD.  A shot that simply stops being mentioned is invisible to
       -- the 7-day acceptance; a deadline that emits a line is falsifiable.
       if clock.sSince(rec.createdNs) >= cfg.settleCapS then
+        -- `release` counts the phase it logs, so nothing increments state.counts.lost here.
         local reason = resolvePath(ino) and "settle-timeout" or "deleted"
-        state.counts.lost = state.counts.lost + 1
         release(rec, "lost", { reason = reason, bytes = rec.size })
         armStrandedCheck(ino, rec.id)
       end
@@ -441,6 +441,10 @@ function M.stats()
     uptime_s = state.started and clock.sSince(state.startedNs) or 0,
     pending = pending, copied_tracked = copied,
     counts = state.counts,
+    -- The sequence of the last VERIFIED clipboard write.  Exposed so acceptance claim L3 — when
+    -- two shots settle in one scan the LATER capture wins the clipboard — is checkable from
+    -- outside the process rather than only inferable from the log.
+    last_copied_seq = clipboard.lastWrittenSeq(),
     watcher = state.w and state.w:stats() or nil,
     thumbnail = thumbnail.stats(),
     log = log.stats(),

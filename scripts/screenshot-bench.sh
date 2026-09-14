@@ -173,7 +173,7 @@ if [[ "$N" -ge 50 && "$QUICK" == "0" ]]; then
   MD_ARG=(--md "$REPO/docs/research/screenshot-acceptance-$(date +%Y-%m-%d).md")
 fi
 
-python3 "$REPO/bench/analyze.py" "$RECORDS" "${MD_ARG[@]+"${MD_ARG[@]}"}" "${LPS_ARG[@]+"${LPS_ARG[@]}"}"
+python3 "$REPO/bench/analyze.py" "$RECORDS" --log "$LOG" "${MD_ARG[@]+"${MD_ARG[@]}"}" "${LPS_ARG[@]+"${LPS_ARG[@]}"}"
 ARC=$?
 rm -f "$RECORDS"
 exit $(( RC != 0 ? RC : ARC ))

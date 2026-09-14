@@ -88,6 +88,10 @@ function Watcher:scan(markOnly, retroWindow, skipIds)
   end
 
   if #fresh == 0 then return count end
+  -- At arm with no retroactive window there is nothing to stat: every name is being remembered,
+  -- not considered.  This matters because the arm pass sees EVERY entry as fresh — 3 425 of them
+  -- on this volume — and a full inode pass is 18 ms per thousand.
+  if markOnly and (not retroWindow or retroWindow <= 0) then return count end
 
   -- Stat ONLY the names absent from `seen`.  A full inode pass over this directory is 18.0 ms
   -- (n=5) against 2.4 ms for the listing alone — up to ~180 ms of main thread per shot if the
@@ -118,7 +122,6 @@ function Watcher:scan(markOnly, retroWindow, skipIds)
     -- 1–2 s start would otherwise be marked "known" and never copied (hostile review item 4).
     -- Never anything older: overwriting a clipboard the user has since filled themselves would be
     -- a worse bug than the one this fixes.
-    if not retroWindow or retroWindow <= 0 then return count end
     local now = os.time()
     for _, c in ipairs(cands) do
       local age = now - (c.attrs.creation or 0)
@@ -146,7 +149,16 @@ function Watcher:arm(retroWindow, skipIds)
   self.dirIno = a.ino
   self.lastSize = a.size or 0
   self.expect = self.lastSize / 32
-  local count = self:scan(true, retroWindow, skipIds)
+  -- 🚨 ONE STAT DECIDES WHETHER 3 425 OF THEM ARE NEEDED.  A file created inside the retroactive
+  -- window must have changed the DIRECTORY's mtime inside that same window, so if the directory
+  -- has not been touched recently, nothing can be retroactively copyable and the whole inode pass
+  -- is skipped.  Measured WITH the pass, on 3 425 entries: 424 ms from the init `start` line to
+  -- the `armed` line, all of it statting files nobody was going to consider.  And it degrades in
+  -- the right direction — the case where the stat pass DOES run is a restart shortly after a
+  -- shot, which is exactly the case bounded retroactivity exists for.
+  local retro = retroWindow or 0
+  if retro > 0 and (os.time() - (a.modification or 0)) > retro then retro = 0 end
+  local count = self:scan(true, retro, skipIds)
   self.countPredicate = (count == self.expect)
   self.lastBackstopNs = clock.mono()
   log.emit("armed", {

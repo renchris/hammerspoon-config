@@ -85,9 +85,33 @@ class LogTail:
         self.path = path
         self.fh = open(path, "r", errors="replace")
         self.fh.seek(0, os.SEEK_END)
+        self.ino = os.fstat(self.fh.fileno()).st_ino
         self.lines = []
 
+    def _reopen_if_rotated(self):
+        """hsc/log.lua rotates at 1 MB ON WRITE, and a 300-sample run adds ~500 KB.
+
+        A tail that holds the old handle keeps reading the renamed file and sees nothing further —
+        which this harness would report as every remaining shot being SILENT, i.e. lost. So the
+        inode is checked, and on a rotation the new file is read from the beginning (the lines we
+        want cannot be older than the rotation).
+        """
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return
+        if st.st_ino == self.ino:
+            return
+        try:
+            self.fh.close()
+        except OSError:
+            pass
+        self.fh = open(self.path, "r", errors="replace")
+        self.ino = os.fstat(self.fh.fileno()).st_ino
+        log("log rotated mid-run — reopened the tail on the new file")
+
     def poll(self):
+        self._reopen_if_rotated()
         for line in self.fh:
             line = line.rstrip("\n")
             if not line:
@@ -294,6 +318,12 @@ def main():
                     ph = line.get("phase")
                     if ph and ph not in phases:
                         phases[ph] = int(line.get("mono", 0))
+                    if ph == "copied":
+                        # The copied line carries its own cost breakdown; keep it, because where
+                        # the milliseconds went is the question every latency finding turns on.
+                        for k in ("read_ns", "pb_write_ns", "pb_verify_ns", "write_ns", "seq"):
+                            if k in line:
+                                rec[k] = int(line[k])
                     if ph in ("copied", "lost"):
                         outcome = ph
                 if outcome:
