@@ -60,26 +60,20 @@ echo "[6/7] Disabling native screenshot thumbnail..."
 defaults write com.apple.screencapture show-thumbnail -bool false
 echo "  Native thumbnail disabled (Hammerspoon provides custom thumbnail)"
 
-# 7. Reload or launch Hammerspoon
-echo "[7/7] Starting Hammerspoon..."
-if pgrep -q Hammerspoon; then
-    echo "  Restarting Hammerspoon..."
-    osascript -e 'tell application "Hammerspoon" to quit' 2>/dev/null
-    sleep 2
-fi
-open -a Hammerspoon
-
-# Poll for launch (up to 10 seconds)
-WAITED=0
-while ! pgrep -q Hammerspoon && [ "$WAITED" -lt 10 ]; do
-    sleep 1
-    WAITED=$((WAITED + 1))
-done
-
-if pgrep -q Hammerspoon; then
-    echo "  Hammerspoon launched (${WAITED}s)."
-else
-    echo "  WARNING: Hammerspoon may not have started. Check manually."
+# 7. Supervise Hammerspoon under launchd — the only launcher from here on. Under KeepAlive a quit
+#    is a restart, so this no longer quits-then-opens: a first install hands the running instance
+#    over to launchd; an already-supervised one just reloads its config in place (same process).
+echo "[7/7] Supervising Hammerspoon (launchd KeepAlive)..."
+WAS_SUPERVISED=0
+launchctl print "gui/$(id -u)/org.hammerspoon.Hammerspoon.keepalive" >/dev/null 2>&1 && WAS_SUPERVISED=1
+bash "$REPO_DIR/scripts/supervise.sh" install
+if [ "$WAS_SUPERVISED" = 1 ]; then
+    # Deferred so the IPC reply returns before the reload tears the port down.
+    if perl -e 'alarm shift; exec @ARGV' 5 hs -c 'hs.timer.doAfter(0.1, hs.reload)' >/dev/null 2>&1; then
+        echo "  Config reloaded."
+    else
+        echo "  WARNING: hs -c did not answer; reload from the Hammerspoon menu (Reload Config)."
+    fi
 fi
 
 echo ""

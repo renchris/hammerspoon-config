@@ -2,9 +2,16 @@
 set -euo pipefail
 
 HS_DIR="$HOME/.hammerspoon"
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "=== Hammerspoon Config Uninstall ==="
 echo ""
+
+# 0. Stop supervising FIRST — under KeepAlive the quit in step 4 would just be a restart. This boots
+#    the agent out (which stops Hammerspoon) and restores the Login Item and Sparkle setting that
+#    were in place before install; --no-launch leaves Hammerspoon stopped.
+echo "[0/4] Removing launchd supervision..."
+bash "$REPO_DIR/scripts/supervise.sh" uninstall --no-launch
 
 # 1. Remove symlink
 echo "[1/4] Removing init.lua symlink..."
