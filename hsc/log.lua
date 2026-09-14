@@ -103,11 +103,11 @@ function M.emit(phase, fields)
 
   local parts = {
     "ts=" .. clock.stamp(),
-    "mono=" .. string.format("%d", clock.mono()),
+    "mono=" .. string.format("%d", math.floor(clock.mono())),
     "phase=" .. phase,
   }
   if fields.id then parts[#parts + 1] = "id=" .. fields.id end
-  if fields.dt then parts[#parts + 1] = string.format("dt=%d", fields.dt) end
+  if fields.dt then parts[#parts + 1] = string.format("dt=%d", math.floor(fields.dt)) end
 
   local extra = {}
   for k, v in pairs(fields) do
@@ -117,7 +117,7 @@ function M.emit(phase, fields)
   for _, k in ipairs(extra) do
     local v = fields[k]
     if type(v) == "number" then
-      v = (v % 1 == 0) and string.format("%d", v) or string.format("%.3f", v)
+      v = (v % 1 == 0) and string.format("%d", math.floor(v)) or string.format("%.3f", v)
     else
       v = tostring(v):gsub("[%s=]", "_")   -- only `file` may carry spaces, and it is last
     end

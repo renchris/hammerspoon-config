@@ -41,12 +41,17 @@ function M.lastWrittenSeq() return lastWritten end
 --- Write `bytes` as public.png and verify.  Returns ok, info.
 --- One retry: a single transient failure must not cost the shot, and two failures are a real fault.
 function M.write(bytes, writeSeq)
+  local wNs, vNs = 0, 0
   local function attempt()
     local before = hs.pasteboard.changeCount()
+    local t0 = hs.timer.absoluteTime()
     local ok = hs.pasteboard.writeAllData(nil, { ["public.png"] = bytes })
+    local t1 = hs.timer.absoluteTime()
     local after = hs.pasteboard.changeCount()
-    if not ok or after <= before then return false, after, 0 end
+    if not ok or after <= before then wNs = t1 - t0; return false, after, 0 end
     local back = hs.pasteboard.readDataForUTI(nil, "public.png")
+    local t2 = hs.timer.absoluteTime()
+    wNs, vNs = t1 - t0, t2 - t1
     local n = back and #back or 0
     return n == #bytes, after, n
   end
@@ -58,7 +63,7 @@ function M.write(bytes, writeSeq)
     ok, cc, n = attempt()
   end
   if ok and writeSeq then lastWritten = writeSeq end
-  return ok, { cc = cc, readback = n, retried = retried }
+  return ok, { cc = cc, readback = n, retried = retried, w_ns = wNs, v_ns = vNs }
 end
 
 --- Optional second write carrying a TIFF flavour, for the day a consumer proves it needs one.

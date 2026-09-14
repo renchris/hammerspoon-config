@@ -97,7 +97,9 @@ end
 function M.start(opts)
   opts = opts or {}
   for k, v in pairs(opts.config or {}) do cfg[k] = v end
-  resolver = opts.resolve
+  -- Only when one is supplied: benchMode() re-enters start() to flip `sound`/`dismiss`, and
+  -- clearing the resolver there would leave every later thumbnail clicking a stale path.
+  if opts.resolve then resolver = opts.resolve end
   refreshScreens()
   if not screenWatcher then
     screenWatcher = hs.screen.watcher.new(refreshScreens)

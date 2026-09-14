@@ -52,22 +52,43 @@ local state = {
 -- the directory.  A screenshot's three names differ only by that prefix, so this resolves any of
 -- them to whichever one exists right now.
 -- ---------------------------------------------------------------------------------------------
+-- Apple's three names differ from each other by a LEADING DOT and, for the streaming temp, by a
+-- trailing "-XXXX" mkstemp suffix:
+--     ..Screenshot X.png-OCez   →   .Screenshot X.png   →   Screenshot X.png
+-- E1 §7's rule was "strip the leading dot(s) and make one inode check", which resolves the second
+-- hop but NOT the first — measured on the first bench capture, where the candidate was caught under
+-- the streaming name and the thumbnail was then silently skipped because no stripped form existed.
+-- So the transform drops the suffix as well.  Still ≤ 3 stats and never a directory scan.
+local function candidateNames(base)
+  local out, seen = {}, {}
+  local function add(n)
+    if n and n ~= "" and not seen[n] then seen[n] = true; out[#out + 1] = n end
+  end
+  add(base)
+  local undotted = base:gsub("^%.+", "")
+  add(undotted)
+  add((undotted:gsub("(%.%a+)%-%w+$", "%1")))
+  add((base:gsub("(%.%a+)%-%w+$", "%1")))
+  return out
+end
+
 local function resolvePath(ino, hint)
   local rec = state.copied[ino] or state.pending[ino]
-  local candidates = {}
-  if hint then candidates[#candidates + 1] = hint end
-  if rec and rec.path then candidates[#candidates + 1] = rec.path end
-  for _, p in ipairs({ candidates[1], candidates[2] }) do
-    if p then
-      local a = hs.fs.attributes(p)
-      if a and a.ino == ino then return p end
+  local tried = {}
+  -- Built explicitly: a table constructor with a nil first element leaves index 1 empty and ipairs
+  -- would stop immediately, silently skipping the recorded path whenever no hint was passed.
+  local roots = {}
+  if hint then roots[#roots + 1] = hint end
+  if rec and rec.path then roots[#roots + 1] = rec.path end
+  for _, p in ipairs(roots) do
+    if p and not tried[p] then
+      tried[p] = true
       local dir, base = p:match("(.*)/([^/]+)$")
       if dir and base then
-        local undotted = base:gsub("^%.+", "")
-        if undotted ~= base then
-          local p2 = dir .. "/" .. undotted
-          local a2 = hs.fs.attributes(p2)
-          if a2 and a2.ino == ino then return p2 end
+        for _, name in ipairs(candidateNames(base)) do
+          local cand = dir .. "/" .. name
+          local a = hs.fs.attributes(cand)
+          if a and a.ino == ino then return cand end
         end
       end
     end
@@ -91,7 +112,19 @@ local function armStrandedCheck(ino, id)
     if not base or not base:match("^%.") then return end   -- already renamed by Apple; nothing to do
     hs.task.new("/usr/bin/pgrep", function(rc)
       if rc == 0 then return end                            -- screencapture still alive; let it finish
-      local final = dir .. "/" .. base:gsub("^%.+", "")
+      -- Never give a name to a file that is not a finished PNG: screencapture can also die
+      -- during the STREAMING phase, and un-hiding that would put a truncated image in the user's
+      -- archive.  Off the hot path by 30 s, so a fresh open costs nothing.
+      local fh = io.open(p, "rb")
+      if not fh then return end
+      local probe = { fh = fh, size = 0, isPng = false }
+      local status = settle.step(probe)
+      fh:close()
+      if status ~= "complete" then
+        log.warn("stranded", { id = id, msg = "incomplete png left behind; not renaming", file = base })
+        return
+      end
+      local final = dir .. "/" .. base:gsub("^%.+", ""):gsub("(%.%a+)%-%w+$", "%1")
       if hs.fs.attributes(final) then return end
       local ok = os.rename(p, final)
       log.emit("stranded", { id = id, renamed = ok and 1 or 0, file = final:match("[^/]+$") })
@@ -160,13 +193,16 @@ local function finish(rec)
   log.emit("capture-complete", { id = rec.id, dt = clock.mono() - rec.createdNs,
                                  bytes = rec.size, file = rec.file })
 
+  local tRead = clock.mono()
   local data = settle.readAll(rec)
   if not data then
     release(rec, "lost", { reason = "unreadable" })
     return
   end
+  local tWrite = clock.mono()
 
   local ok, info = clipboard.write(data, rec.seq)
+  local tDone = clock.mono()
   if not ok then
     log.error("clipboard", { id = rec.id, msg = "write not verified", cc = info.cc,
                              readback = info.readback, file = rec.file })
@@ -178,19 +214,25 @@ local function finish(rec)
   state.copied[rec.ino] = { path = rec.path, file = rec.file, t = clock.mono() }
   state.counts.copied = state.counts.copied + 1
   log.emit("copied", { id = rec.id, dt = clock.mono() - rec.createdNs, bytes = #data,
-                       cc = info.cc, seq = rec.seq, retried = info.retried, file = rec.file })
+                       cc = info.cc, seq = rec.seq, retried = info.retried,
+                       read_ns = tWrite - tRead, write_ns = tDone - tWrite,
+                       pb_write_ns = info.w_ns, pb_verify_ns = info.v_ns, file = rec.file })
   clipboard.watchForClobber(info.cc, rec.id, rec.file, cfg.clobberAfterS)
 
-  -- Only now does anything decode the image.
+  -- Only now does anything decode the image — and it decodes the bytes we just PROVED are on the
+  -- pasteboard, not a path.  A capture is renamed twice while we hold it, so at this instant the
+  -- name we caught it under may already be gone; reading the board back removes that dependency
+  -- entirely and costs one transfer we were going to pay to hs.image anyway.  The CLICK target is
+  -- still a path, but it is resolved by inode at click time, seconds later, when the final name
+  -- certainly exists.
+  local path = resolvePath(rec.ino, rec.path) or rec.path
+  local img = hs.pasteboard.readImage()
+  if not img then img = hs.image.imageFromPath(path) end
   local shown = false
-  local path = resolvePath(rec.ino, rec.path)
-  if path then
-    local img = hs.image.imageFromPath(path)
-    if img then
-      shown = thumbnail.show({ ino = rec.ino, id = rec.id, path = path, file = rec.file,
-                               createdNs = rec.createdNs }, img)
-      if cfg.tiff then clipboard.writeTiffLater(data, img) end
-    end
+  if img then
+    shown = thumbnail.show({ ino = rec.ino, id = rec.id, path = path, file = rec.file,
+                             createdNs = rec.createdNs }, img)
+    if cfg.tiff then clipboard.writeTiffLater(data, img) end
   end
   if not shown then
     log.warn("thumb", { id = rec.id, msg = "no thumbnail (image could not be decoded)", file = rec.file })
