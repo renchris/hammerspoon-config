@@ -19,6 +19,10 @@ Gap-fill reports B1, D2, E1 and F1 (with its addendum) are integrated below (202
 Nothing in Phases 1–6 has been implemented yet. Hammerspoon was relaunched by hand at 00:20:18,
 displaced by a stray second instance at 12:03:36 (KB §F1b; two shots lost outright at 13:33), and
 relaunched again at 15:16:28 — still unsupervised.
+**2026-09-13 (W2+W4, one dispatched session): Phase 1 IMPLEMENTED and proven live** — Hammerspoon
+runs under `org.hammerspoon.Hammerspoon.keepalive`; `supervise.sh --prove`: respawn 49 ms, detector
+downtime 565 ms, 1 instance; Login Item removed only after TCC was asserted on the launchd instance.
+Phase 6 status is recorded under its own heading. W1 (Phases 2–5a) runs in parallel.
 
 **Targets (acceptance, all measured by the bench in Phase 5 and by 7 days of real use):**
 
@@ -80,6 +84,23 @@ unit inside the 40–150K band.
 ---
 
 ## Phase 1 — Supervision: Hammerspoon restarts in under a second, exactly one instance (W2)
+
+**Status: DONE 2026-09-13 (W2)** — commits `feat: launchd KeepAlive supervision of Hammerspoon —
+respawn 49 ms, exactly one instance`, `fix: supervise.sh needs no coreutils timeout…`, `feat: install
+and uninstall hand Hammerspoon to launchd supervision`, `docs: troubleshooting for launchd
+supervision…`. Measured live: install armed the watcher 498 ms after bootstrap; **TCC
+`accessibility,screen-recording,eventtap = true,true,true` on the launchd-started instance**, asserted
+BEFORE the Login Item was deleted, with auto-rollback to the old launcher on any `false` (this closes
+§ Completeness critic item 1 mechanically — the untested launch provenance is now tested on every
+install); `--prove` respawn **49 ms**, detector downtime **565 ms** (kill → `poll armed`), 1 instance;
+`uninstall` → `install` round trip restored and re-removed the Login Item (hidden flag and Sparkle
+value recorded once, restored exactly); `install` is idempotent. Learnings: (1) bootstrapping with
+`RunAtLoad` beside a LaunchServices instance IS the §F1b double launch, so `install` SIGTERMs the
+unsupervised instance first; (2) `status`/`--prove` read both the legacy `poll armed` line and W1's
+logfmt `phase=armed`, so W1's log rewrite does not break supervision; (3) the plist's
+ProgramArguments stays the binary, never a `supervise.sh --run` wrapper — a wrapper would make
+Hammerspoon's launch depend on a git checkout existing and change the TCC provenance just verified.
+Step 4 (single-instance detection via `pcall(require, "hs.ipc")`) lives in `init.lua` and is W1's.
 
 **Why.** Failure class A: SIGTERMed 2026-09-09 18:55:16 by a fleet census, dead 5.4 h, nothing
 relaunched it (KB §F1). The fleet has killed processes by pattern three times before. Measured:
@@ -474,6 +495,9 @@ proven, its remaining value is negative.
   observed listings-per-shot** so the real number is measured after landing rather than inherited.
 - **KeepAlive with ThrottleInterval=1, Login Item removed, Sparkle auto-update off** — the three
   together are what "exactly one instance, back in under a second" requires.
+  **(Superseded on the throttle by K3, as shipped 2026-09-13: the DEFAULT ThrottleInterval — a mature
+  job re-forked in 49 ms end to end at the default; `=1` would only turn a start-up crash into a 1 Hz
+  loop.)**
 - **Bounded retroactivity (15 s at arm)** replaces "never retroactive": the 2026-09-08 rationale
   (do not overwrite what the user has since copied) holds for old files, not for a shot taken
   during a 2 s restart.
