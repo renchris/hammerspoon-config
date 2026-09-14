@@ -171,6 +171,15 @@ cmd_status() {
             say "heartbeat=MISSING — this instance never armed the watcher (config not loaded?)"; healthy=0
         fi
     fi
+    # The retired fallback writer (claude-infrastructure, removed 2026-09-13). A deploy of an older
+    # infra tree re-bootstraps it and nothing there boots it out again, so the one pipeline check
+    # that runs here watches for it: a second clipboard writer can land an older shot over a newer one.
+    if launchctl print "$DOMAIN/com.chrisren.screenshot-clipboard" >/dev/null 2>&1; then
+        say "fallback_agent=LOADED — retired 2026-09-13; remove: launchctl bootout $DOMAIN/com.chrisren.screenshot-clipboard && rm -f ~/Library/LaunchAgents/com.chrisren.screenshot-clipboard.plist ~/bin/screenshot-to-clipboard.sh"
+        healthy=0
+    else
+        say "fallback_agent=absent"
+    fi
     li="$(login_item_count)"; su="$(sparkle_auto_update)"
     say "login_item=$li sparkle_auto_update=$su"
     [ "$li" = 0 ] || healthy=0

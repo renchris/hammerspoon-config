@@ -71,12 +71,29 @@ over whatever Hammerspoon already wrote. Two shots inside that window end with t
 on the clipboard.
 
 **Fix** (2026-09-08): the agent exits immediately when Hammerspoon is running and acts only
-as a fallback when it is not. Verify:
+as a fallback when it is not.
+
+**RETIRED 2026-09-13.** The agent, its plist and `~/bin/screenshot-to-clipboard.sh` are gone
+(claude-infrastructure `chore(launchd): retire com.chrisren.screenshot-clipboard`; its
+`launchd/fleet.manifest` row reads `retired`). Hammerspoon is now supervised by launchd (see
+"Hammerspoon is supervised by launchd" below), so the fallback's window shrank to the ~0.6 s
+restart — and inside that window it was harmful: it deferred to any Hammerspoon *pid* (a zombie
+whose config never loaded, on 2026-09-10), its 10 s launchd throttle × 10 s recency guard dropped
+every shot Apple stalled, and it could land an older PNG over a newer shot (plan Phase 6). If
+this symptom ever returns, a second clipboard writer is back — find it:
 
 ```bash
-grep -n 'pgrep -xq Hammerspoon' ~/bin/screenshot-to-clipboard.sh   # the deferral line
-launchctl print "gui/$(id -u)/com.chrisren.screenshot-clipboard" | grep -E 'state|runs'
+bash scripts/supervise.sh status | grep fallback_agent               # must read: fallback_agent=absent
+launchctl print "gui/$(id -u)/com.chrisren.screenshot-clipboard"   # must fail: "Could not find service"
+ls ~/Library/LaunchAgents | grep -i -e screenshot -e clipboard      # must print nothing
 ```
+
+It can come back: claude-infrastructure's deployer runs `install.sh` from the newest green tree,
+and any tree older than the retirement still declares the agent `run` and re-bootstraps it; the
+newer `install.sh` never boots a retired label out again. `status` turns NOT-HEALTHY and prints
+the one-line removal when that happens.
+
+Dictation tools (VoiceInk, Wispr Flow) also write the clipboard around a dictation.
 
 ## No thumbnail appears
 
