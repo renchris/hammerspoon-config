@@ -68,8 +68,10 @@ WAS_SUPERVISED=0
 launchctl print "gui/$(id -u)/org.hammerspoon.Hammerspoon.keepalive" >/dev/null 2>&1 && WAS_SUPERVISED=1
 bash "$REPO_DIR/scripts/supervise.sh" install
 if [ "$WAS_SUPERVISED" = 1 ]; then
-    # Deferred so the IPC reply returns before the reload tears the port down.
-    if perl -e 'alarm shift; exec @ARGV' 5 hs -c 'hs.timer.doAfter(0.1, hs.reload)' >/dev/null 2>&1; then
+    # Deferred so the IPC reply returns before the reload tears the port down. Bounded by hs's own
+    # -t, never an external timeout: killing the client mid-reply crashes Hammerspoon (see
+    # supervise.sh hs_eval).
+    if hs -t 4 -c 'hs.timer.doAfter(0.1, hs.reload)' >/dev/null 2>&1; then
         echo "  Config reloaded."
     else
         echo "  WARNING: hs -c did not answer; reload from the Hammerspoon menu (Reload Config)."

@@ -127,8 +127,12 @@ wait_no_hammerspoon() {
 hs_eval() {
     local out
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        # perl's alarm, not coreutils `timeout`: macOS does not ship the latter.
-        out="$(perl -e 'alarm shift; exec @ARGV' 5 hs -c "$1" 2>/dev/null || true)"
+        # 🚨 NEVER wrap `hs -c` in an external timeout (coreutils `timeout`, perl alarm, kill): a
+        # client killed mid-reply leaves Hammerspoon replying to a dead message port, and that is
+        # the EXC_BREAKPOINT in CFMessagePortSendRequest ← ipc_sendMessage that crashed it on
+        # 2026-09-10 12:03 and 2026-09-13 21:01 (W1 traced the second to exactly this). `hs` bounds
+        # its own send/receive (`-t`, default 4 s) and exits cleanly when that fires.
+        out="$(hs -t 4 -c "$1" 2>/dev/null || true)"
         if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
         sleep 0.5
     done
