@@ -640,6 +640,20 @@ through `hsc/log.lua`" is not stylistic.
 - **`phase=renamed` routinely lands seconds after `phase=copied`** — the whole point of the phase,
   visible in the log on every shot.
 
+### The acceptance run, in one paragraph
+
+`bash scripts/screenshot-bench.sh 300` ran unattended and aborted at **197** when the operator
+returned — the pointer-delta guard working as designed. **`lost 0/197`** and **clipboard bytes ==
+file bytes 197/197**, so L1 and L2 pass. `png-complete → copied` measured **p50 20.8 / p99 34.2 /
+p100 38.3 ms**, which **misses the ≤ 15 ms p50 / ≤ 30 ms p100 row — at this capture size**, and the
+size is the bench's own precondition: 180 s of idle is what locks this Mac's screen, and the lock
+wallpaper is a photograph, so the median capture is **8.1 MB against the 2.4 MB image every target
+was calibrated on**. The two measured size bands give the slope (≈ 0.93 ms/MB), which extrapolates
+to ≈ 15.2 ms p50 / ≈ 28.9 ms p100 at the calibration size — an extrapolation, stated as one.
+Phase 2's own Verify criterion is met outright: a deliberate 3 s stall put Apple's final rename
+**3 032 ms** after a `copied` that landed 22 ms after the PNG was complete. Full record, including
+what the run did not exercise: `docs/research/screenshot-acceptance-2026-09-13.md`.
+
 ### Still open after W1 + W3
 
 Critic items **6, 8 and 10** are untouched and owned by W4/W5 (items 1 and 2 are W2's and it

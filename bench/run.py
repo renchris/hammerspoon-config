@@ -29,7 +29,7 @@ under this load, so a disagreement > 100 ms fails the iteration and its timestam
 subtracted to produce a latency.
 """
 
-import argparse, json, os, re, shutil, signal, subprocess, sys, time, uuid
+import argparse, glob, json, os, re, shutil, signal, subprocess, sys, time, uuid
 
 HOME = os.path.expanduser("~")
 DEFAULT_DIR = os.path.join(HOME, "Screenshots")
@@ -169,30 +169,48 @@ def wait_for_file(path, deadline_s):
     return False
 
 
-def capture(path, rect, stall_s=0.0, hidden_hint=None):
-    """Spawn screencapture.  Returns (t_spawn_mono_ns, returncode).
+def capture(path, rect, stall_s=0.0, tail=None):
+    """Spawn screencapture.  Returns (t_spawn_mono_ns, returncode, stalled).
 
-    In --stall mode the child is SIGSTOPped as soon as its hidden file appears — i.e. between the
-    complete PNG and the rename — which is exactly where Apple's Spotlight call sits.  A pipeline
-    that copies from the dotfile must produce `copied` long before `renamed`.
+    🚨 --stall TRIGGERS OFF THE PIPELINE'S OWN `copied` LINE, and two earlier designs did not work.
+    The point of the test is Phase 2's claim in its strongest form: *the clipboard was filled from
+    the hidden file while Apple had not renamed anything yet.*  So the child is SIGSTOPped the
+    moment the log says `copied`, held for `stall_s`, and released — after which `renamed` must
+    trail `copied` by at least that long.
+
+    What failed first: waiting for `.Name.png` to appear watched only ONE of the two hidden
+    spellings (the streaming temp is `..Name.png-XXXX`), and widening it to glob for both was
+    still too slow — a glob over a 3 400-entry directory costs more than the window is wide
+    (measured: the hidden forms live tens of milliseconds for a 1.6 MB capture, and neither
+    version ever actually stopped the child: renamed − copied came out at 0.28–0.74 s, i.e. the
+    ordinary Apple rename delay).  Reading a line the pipeline has already written costs nothing
+    and cannot miss.
     """
     t0 = time.monotonic_ns()
     proc = subprocess.Popen(["/usr/sbin/screencapture", "-x",
                              "-R%d,%d,%d,%d" % rect, path])
-    if stall_s > 0 and hidden_hint:
-        end = time.monotonic() + 5
-        while time.monotonic() < end:
-            if os.path.exists(hidden_hint):
+    stalled = False
+    if stall_s > 0 and tail is not None:
+        end = time.monotonic() + 10
+        while time.monotonic() < end and proc.poll() is None:
+            hit = False
+            for line in tail.poll():
+                if line.get("phase") in ("capture-complete", "copied") \
+                        and int(line.get("mono", 0)) > t0:
+                    hit = True
+                    break
+            if hit:
                 try:
                     os.kill(proc.pid, signal.SIGSTOP)
                     time.sleep(stall_s)
                     os.kill(proc.pid, signal.SIGCONT)
+                    stalled = True
                 except ProcessLookupError:
                     pass
                 break
-            time.sleep(0.005)
+            time.sleep(0.002)
     rc = proc.wait()
-    return t0, rc
+    return t0, rc, stalled
 
 
 def main():
@@ -278,7 +296,6 @@ def main():
             # listing, and reusing one would make any dedup mistake look like a clean pass.
             name = f"Screenshot BENCH {run_id} {i:04d}.png"
             path = os.path.join(args.dir, name)
-            hidden = os.path.join(args.dir, "." + name)
             rect = (0, 0, 0, 0)
             if FULL_EVERY and i % FULL_EVERY == FULL_EVERY - 1:
                 rect = (0, 0, 3000, 2000)     # clipped to the display by screencapture
@@ -288,7 +305,7 @@ def main():
                 band = "base"
 
             stall = args.stall if (args.stall_every and i % args.stall_every == 0) else 0.0
-            t_spawn, rc = capture(path, rect, stall, hidden)
+            t_spawn, rc, stalled = capture(path, rect, stall, tail)
 
             if not wait_for_file(path, 35.0):
                 records.append({"i": i, "name": name, "band": band, "outcome": "no-artifact",
@@ -300,6 +317,7 @@ def main():
             st = os.stat(path)
             rec = {
                 "i": i, "name": name, "band": band, "rc": rc, "stall_requested_s": stall,
+                "stall_applied": stalled,
                 "ino": st.st_ino, "id": ino_id(st.st_ino), "bytes": st.st_size,
                 "t_spawn_mono": t_spawn,
                 "png_complete_mono": mono_of_realtime_ns(st.st_mtime_ns),
