@@ -22,7 +22,9 @@ relaunched again at 15:16:28 — still unsupervised.
 **2026-09-13 (W2+W4, one dispatched session): Phase 1 IMPLEMENTED and proven live** — Hammerspoon
 runs under `org.hammerspoon.Hammerspoon.keepalive`; `supervise.sh --prove`: respawn 49 ms, detector
 downtime 565 ms, 1 instance; Login Item removed only after TCC was asserted on the launchd instance.
-Phase 6 status is recorded under its own heading. W1 (Phases 2–5a) runs in parallel.
+**Phase 6 DONE the same session**: the fallback agent is retired in claude-infrastructure
+(`f0e75272b`, landed) and booted out on this box — details and the one resurrection path under its
+heading. W1 (Phases 2–5a) runs in parallel.
 
 **Targets (acceptance, all measured by the bench in Phase 5 and by 7 days of real use):**
 
@@ -424,6 +426,30 @@ proven, its remaining value is negative.
 `launchd/com.chrisren.screenshot-clipboard.plist` and `bin/screenshot-to-clipboard.sh` (and the
 `~/bin` symlink) through that repo's `/ship` flow; note it in this repo's TROUBLESHOOTING as retired.
 
+**Status: DONE 2026-09-13 (W4, same session as W2, after `--prove` passed).** claude-infrastructure
+`f0e75272b` (`chore(launchd): retire com.chrisren.screenshot-clipboard…`) + `02b1b2ae6` (bats
+SC2066 fix the land gate caught) landed via `ship-land.sh`, content-verified, sweep clean. That
+change also dropped the tool from `install.sh`'s and `sync.sh`'s `~/bin` lists (sync copies `~/bin`
+BACK into the repo, so a stale copy would have resurrected it), flipped its `fleet.manifest` row to
+`retired` rather than deleting it, and updated `osa-bounds.bats`, the unattended-path allowlist and
+the README job table. Live box: agent booted out (`launchctl print` → 113, "Could not find
+service"), `~/Library/LaunchAgents/…screenshot-clipboard.plist` and `~/bin/screenshot-to-clipboard.sh`
+(a real file, not a symlink) removed. Two things for a successor:
+- 🚨 **It can be resurrected by infra's deployer.** At retirement time `postland-verify` was running
+  on `b359dcfdc` — the tree just BEFORE the retirement. If that stamps green, `deploy-live` advances to
+  it, and its `install.sh` re-copies the plist + script and re-bootstraps the `run`-declared label
+  (it even clears a disabled bit first, so `launchctl disable` cannot pre-empt it); the newer
+  `install.sh` never boots a retired label out again. **Detection shipped here instead of a change
+  to infra's autonomous deploy path:** `supervise.sh status` prints `fallback_agent=LOADED` + the
+  removal one-liner and turns NOT-HEALTHY.
+- **Gate chosen: `--prove`, not critic item 2's 7 days** (the dispatch brief's call). The residual
+  critic 2 names is real and now unowned by any running thing: a start-up crash loop relaunches every
+  10 s with no notification. `status` makes it legible (`launchd_runs` climbing with a young `age_s`,
+  `launchd_last_exit_code`), but nothing runs `status` on a schedule — that is critic item 6's
+  auditor (heartbeat file + birth-time join), still open. What was lost is small: the fallback
+  deferred on any Hammerspoon pid, so it covered a crash loop only in the gaps between relaunches,
+  late and PNG-only.
+
 ## Phase 7 — Experiments (W5, optional; each one closes an open question)
 
 1. **Clipboard-destination hybrid** (devil's advocate, KB §5 B) — **the experiment's QUESTION is now
@@ -520,6 +546,7 @@ proven, its remaining value is negative.
 | completeness critic (Z) | **delivered** (14 KB, fresh context, 0 captures) — 12 ranked gaps, own measurements | 3 were defects in this plan and are **corrected above** (Phase 2 step 1b net-zero backstop; step 2b predicate off-by-two + wrong key + ~10× budget; decision-log listings budget). 8 remain open with owners in § Completeness critic — **items 1, 3 and 2 are pre-landing gates on W2, W1 and W4** |
 | gap-fill B2 (screencapture internals) | **delivered** (31 KB, disassembly) and integrated (Phase 2 preamble, Phase 7 item 1, KB §F2) | The stall is an unguarded straight-line call (`sub_100019794`), so no preference or exclusion can remove it — the dotfile copy is the ONLY fix. Three constraints adopted: **Esc cancels with exit 0** (never use the exit code as a capture verdict), `screencapture` does not exit until after the rename, and `show-thumbnail=0` is a precondition rather than a constant. `-c` cannot stall and writes exactly one flavor — D2 §7 upgraded from reasoned to static |
 | gap-fill F2 (main-thread blockers) | **delivered** (40 KB, live Hammerspoon at load 33–39) and integrated (Phase 3 rewritten, KB §F4 rewritten) | **Refutes this plan's own magnitudes**: the Dock rebind runs ≈2×/day, not continuously, and five headline figures (20 ms `getCurrentScreen`, 3.9 ms `getByName`, 8.6 ms `plist.read`, 7 ms listing, 27–60 µs stat) were **first-call module-load artifacts**. The rebind is still removed — for its **unbounded** tail (`hs.execute` has no timeout), not its mean. Real per-shot cost is ~120 ms of image work. The eventtap **self-heals**; the settle loop's repeated read is latent until Phase 2 lands. New: warm the lazy modules at load (~20–40 ms off the first shot after every relaunch) |
+| W2 Phase 1 live proof (2026-09-13) | **measured on the real job**, not the `/bin/sleep` proxy | `--prove`: respawn **49 ms**, detector downtime **565 ms** (kill → armed), 1 instance; K3's "mature job re-forks fast at the default throttle" confirmed on Hammerspoon itself; TCC intact under launchd provenance (critic item 1 closed) |
 | gap-fill C1 (kqueue helper vs the poll) | **delivered** (32 KB, conviction 88 %) and integrated (Phase 2 step 1, Phase 7 item 3, decision log) | Helper **rejected on its own numbers** (~4 ms p50 / ~7 ms p99 saved, for a permanent-deafness failure mode + a second unsupervised process). The axis's real yield is the opposite finding: the **shipped** `mtime:ctime:size` signature has a structural blind spot — ~3 % of shots at the 50 ms poll, one production instance at 6 026 ms (KB §F7, failure mode 14) — closed by the one-line `st_size`-only signature |
 
 ## Completeness critic (Z, 2026-09-11) — what must close before these phases can honestly promise 100.00 %
@@ -551,6 +578,15 @@ sufficiency; the `-R`-is-not-the-keyboard-path caveat; the bench's mds-contamina
 W1 respectively, and both need one operator-attended minute. Item 2 changes W4's gate from an event
 to a duration. These are not "nice to have before shipping" — each one is a path where the wave lands
 green and the pipeline is silently worse than today.
+
+**Disposition as W2/W4 shipped (2026-09-13).** Item 1 — **CLOSED, and made mechanical**: every
+`supervise.sh install` asserts `hs.accessibilityState()`, `hs.screenRecordingState()` and
+`hs.eventtap` on the launchd-started instance before deleting the Login Item, rolling back on any
+failure; live result `true,true,true`, then two real ⌘⇧4 shots (8:43:29 and 8:44:44 PM) were
+`copied` by that same launchd pid. The "one real ⌘V" half is not assertable from a script and was
+not separately observed; the tap's precondition (Accessibility + a live `hs.eventtap`) was. Item 2 —
+**W4 gated on `--prove` per the dispatch brief, not on 7 days**; the crash-loop residual is recorded
+under Phase 6's status and stays owned by item 6's auditor.
 
 ## Risks and rollbacks
 
