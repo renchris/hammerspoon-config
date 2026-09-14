@@ -104,6 +104,17 @@ ProgramArguments stays the binary, never a `supervise.sh --run` wrapper — a wr
 Hammerspoon's launch depend on a git checkout existing and change the TCC provenance just verified.
 Step 4 (single-instance detection via `pcall(require, "hs.ipc")`) lives in `init.lua` and is W1's.
 
+**First real crash, recovered unattended (2026-09-13 21:01:43).** The launchd instance (pid 27658,
+running W1's config through the symlink during its bench) died of **`EXC_BREAKPOINT` in
+`CFMessagePortSendRequest` ← `libipc ipc_sendMessage`** (`~/Library/Logs/DiagnosticReports/
+Hammerspoon-2026-09-13-210146.ips`) — the **same hs.ipc crash class as 2026-09-10 12:03:36**, preceded
+88 s earlier by `phase=error msg=…hs/ipc.lua:81: ipc port is no longer valid (early)`: something
+still sends to a dead `hs -c` client's port. KeepAlive re-forked it and the watcher logged
+`phase=armed` at 21:01:43.794 — **~0.7 s crash → armed, no human involved**; `status` showed
+`launchd_runs=2`, `launchd_last_terminating_signal=Trace/BPT trap: 5`. Before this phase the same
+crash meant hours dead. 🚨 **Owner W1**: the crash class is still live under the new config; a
+shipped `hs -c`-heavy bench will keep triggering it.
+
 **Why.** Failure class A: SIGTERMed 2026-09-09 18:55:16 by a fleet census, dead 5.4 h, nothing
 relaunched it (KB §F1). The fleet has killed processes by pattern three times before. Measured:
 `KeepAlive=true` + `ThrottleInterval=1` respawns in 0.04–0.05 s; the default throttle makes it ~10 s.
