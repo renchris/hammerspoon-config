@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Supervise Hammerspoon: launchd restarts it the moment it dies, and it is the ONLY launcher.
+
+  Why (docs/research/screenshot-pipeline-2026-09-10.md §F1, §F1b, §F6, §F9 K3):
+  - 2026-09-09 18:55 a fleet census SIGTERMed Hammerspoon; as a plain Login Item nothing restarted
+    it, and the ⌘⇧4 → clipboard pipeline was dead for 5.4 h.
+  - KeepAlive re-forks a MATURE job in ~1 ms at the DEFAULT ThrottleInterval (K3 refuters, n=15).
+    ThrottleInterval is deliberately absent: =1 would only turn a start-up crash into a 1 Hz loop.
+  - ProgramArguments is the binary itself, never a wrapper: TCC grants (Accessibility, Screen
+    Recording) are keyed to the signed bundle, and `supervise.sh install` asserts both on this exact
+    launch provenance before it removes the Login Item.
+  - A Program-launched agent bypasses LaunchServices' single-instance check, so the Login Item must
+    go (supervise.sh does it) or login would start a second instance (§F8 item 3).
+
+  Install / remove ONLY through scripts/supervise.sh (bootstrap/bootout, never load/unload).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.hammerspoon.Hammerspoon.keepalive</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>org.hammerspoon.Hammerspoon</string>
+  </array>
+</dict>
+</plist>
