@@ -71,19 +71,23 @@ pid_age_s() {
     echo $(( 10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))
 }
 
-# The heartbeat: epoch-ms of the FIRST watcher-armed line at or after $1 (epoch ms), else nothing.
+# The heartbeat: epoch-ms of the FIRST watcher-armed line at or after $1 (epoch ms), else nothing;
+# with $2 = last, the LAST such line (a reload re-arms inside the same process).
 # Accepts both the legacy line (`2026-09-13 18:24:43.245 I screenshot poll armed on …`) and the
 # logfmt line W1 introduces (`ts=2026-09-13T18:24:43.245-0500 mono=… phase=armed …`); both are
 # local wall-clock time with ms, the same clock now_ms() reads.
 armed_since_ms() {
     [ -r "$SHOT_LOG" ] || return 0
     perl -MPOSIX=mktime -ne '
-        BEGIN { $since = shift @ARGV }
+        BEGIN { $since = shift @ARGV; $mode = shift @ARGV }
         next unless /poll armed|\bphase=armed\b/;
         next unless /^(?:ts=)?(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d)(?:\.(\d{1,3}))?/;
         my $ms = mktime($6, $5, $4, $3, $2 - 1, $1 - 1900, 0, 0, -1) * 1000 + ($7 // 0);
-        if ($ms >= $since) { print "$ms\n"; exit 0 }
-    ' "$1" "$SHOT_LOG"
+        next unless $ms >= $since;
+        if ($mode ne "last") { print "$ms\n"; exit 0 }
+        $last = $ms;
+        END { print "$last\n" if defined $last }
+    ' "$1" "${2:-first}" "$SHOT_LOG"
 }
 
 # Block until an armed line at/after $1 appears; print its epoch ms. rc 1 on timeout.
@@ -123,7 +127,8 @@ wait_no_hammerspoon() {
 hs_eval() {
     local out
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        out="$(timeout 5 hs -c "$1" 2>/dev/null || true)"
+        # perl's alarm, not coreutils `timeout`: macOS does not ship the latter.
+        out="$(perl -e 'alarm shift; exec @ARGV' 5 hs -c "$1" 2>/dev/null || true)"
         if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
         sleep 0.5
     done
@@ -159,9 +164,9 @@ cmd_status() {
     if [ -n "$pid" ] && age="$(pid_age_s "$pid")"; then
         say "age_s=$age"
         start_ms=$(( ( $(date +%s) - age - 1 ) * 1000 ))
-        armed="$(armed_since_ms "$start_ms")"
+        armed="$(armed_since_ms "$start_ms" last)"
         if [ -n "$armed" ]; then
-            say "heartbeat=armed $(( ( $(now_ms) - armed ) / 1000 ))s ago (after this instance started)"
+            say "heartbeat=armed $(( ( $(now_ms) - armed ) / 1000 ))s ago (latest arm since this instance started)"
         else
             say "heartbeat=MISSING — this instance never armed the watcher (config not loaded?)"; healthy=0
         fi
