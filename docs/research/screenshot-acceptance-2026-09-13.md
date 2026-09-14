@@ -177,11 +177,13 @@ the same incident from opposite ends, and **W2's instrument is the right one**:
   Hammerspoon replying to a CLI client's message port after the client has gone, and what makes a
   client go away mid-reply is `timeout N hs -c …` — which this session ran dozens of times while
   syntax-checking Lua through the live instance, each retry leaving another dead port. **The shipped
-  bench never does it**: every `hs -c` in `scripts/screenshot-bench.sh` is unguarded by `timeout`
-  and falls back with `|| true` on failure rather than being killed. So the risk is a development
-  habit, not a shipped one — but W1 owns the Lua side of the crash class, nothing in this config can
-  stop a Hammerspoon *extension* from writing through a stale port, and supervision is what covers
-  the residue.
+  bench never did it**: no `hs -c` in `scripts/screenshot-bench.sh` was wrapped in `timeout`. It is
+  now bounded the right way instead — **`hs -t <seconds>`**, the CLI's own client-side limit, which
+  tears the port down cleanly and also removes the hang risk of waiting forever on a wedged
+  Hammerspoon. W2 found the same pattern in `supervise.sh` and `install.sh` (a `perl` alarm around
+  `hs -c`) and changed both (`1aa6720`). W1 owns the Lua side of the crash class, and the residue is
+  irreducible: nothing in this config can stop a Hammerspoon *extension* from writing through a
+  stale port, which is what supervision covers.
 
 ### What this run did NOT exercise
 

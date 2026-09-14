@@ -17,6 +17,13 @@
 # /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon starts a SECOND instance that displaces
 # the live one — that is how the config died on 2026-09-10 at 12:03:36.  Reloads go through
 # `hs -c 'hs.reload()'`.
+#
+# 🚨 And every `hs` call here bounds itself with `hs -t <seconds>`, NEVER with `timeout N hs -c …`.
+# The difference is not style: a `timeout`-killed client leaves a dead message port, Hammerspoon
+# sends its reply into it, and the process dies of EXC_BREAKPOINT in `CFMessagePortSendRequest` —
+# measured 2026-09-13 at 21:01:43 on this box, the same crash class as 2026-09-10 12:03:36 (launchd
+# re-forked it and the watcher re-armed in 0.7 s, so it cost nothing, but unsupervised it cost
+# hours).  `hs -t` is the CLI's own client-side bound and tears the port down cleanly.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -108,7 +115,7 @@ restore_link() {
     ln -sfn "$ORIGINAL" "$LINK"
     logline warn "msg=bench-symlink-restored target=$ORIGINAL"
     note "restored ~/.hammerspoon/init.lua -> $ORIGINAL"
-    hs -c 'hs.reload()' >/dev/null 2>&1 || true
+    hs -t 10 -c 'hs.reload()' >/dev/null 2>&1 || true
     sleep 3
   fi
 }
@@ -125,7 +132,7 @@ if [[ "$RELINK" == "1" ]]; then
     logline warn "msg=bench-symlink-pointed target=$REPO/init.lua was=${CURRENT:-none}"
     ln -sfn "$REPO/init.lua" "$LINK"
     note "pointed ~/.hammerspoon/init.lua -> $REPO/init.lua (was ${CURRENT:-not a symlink})"
-    hs -c 'hs.reload()' >/dev/null 2>&1 || true
+    hs -t 10 -c 'hs.reload()' >/dev/null 2>&1 || true
     sleep 4
   else
     note "~/.hammerspoon/init.lua already points at this checkout"
@@ -133,11 +140,11 @@ if [[ "$RELINK" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------- bench mode
-hs -c 'return require("hsc.screenshot").benchMode(true)' >/dev/null 2>&1 || \
+hs -t 5 -c 'return require("hsc.screenshot").benchMode(true)' >/dev/null 2>&1 || \
   note "WARNING: could not enter bench mode over hs.ipc (an unreliable transport under load)"
 # math.floor before tostring: hs returns Lua numbers as floats ("128.0"), and stripping
 # non-digits from that yields 1280 — which is how a listings-per-shot of -230.00 got printed.
-counter() { hs -c "local s=require('hsc.screenshot').stats(); return tostring(math.floor($1))" 2>/dev/null \
+counter() { hs -t 5 -c "local s=require('hsc.screenshot').stats(); return tostring(math.floor($1))" 2>/dev/null \
               | grep -a -oE '^[0-9]+$' | tail -1; }
 LISTINGS_BEFORE=$(counter "(s.watcher and s.watcher.listings) or 0")
 SHOTS_BEFORE=$(counter "s.counts.created or 0")
@@ -149,7 +156,7 @@ python3 "$REPO/bench/run.py" "$N" --probe "$PROBE_BIN" --log "$LOG" --out "$RECO
 RC=$?
 set -e
 
-hs -c 'return require("hsc.screenshot").benchMode(false)' >/dev/null 2>&1 || true
+hs -t 5 -c 'return require("hsc.screenshot").benchMode(false)' >/dev/null 2>&1 || true
 
 if [[ ! -s "$RECORDS" ]]; then
   note "no records written (rc=$RC) — nothing to analyse"

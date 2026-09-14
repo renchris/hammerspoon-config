@@ -301,8 +301,12 @@ is not. On 2026-09-13 at 21:01:43 the live instance died of `EXC_BREAKPOINT` in
 message port after the client had gone — and what makes a client go away mid-reply is exactly
 `timeout N hs -c …`, which that session had been running dozens of times to syntax-check Lua.
 launchd re-forked it and the watcher re-armed in 0.7 s, so the cost was small; before supervision
-the identical crash meant hours dead. Let an `hs -c` call finish, or do not start it. Nothing in
-`scripts/screenshot-bench.sh` wraps one.
+the identical crash meant hours dead.
+
+**Use `hs -t <seconds>` instead** — the CLI's own client-side bound, which tears the port down
+cleanly. Every `hs` call in `scripts/screenshot-bench.sh` uses it (`-t 10` for a reload, `-t 5` for
+a stats read); `scripts/supervise.sh` and `scripts/install.sh` were changed the same way
+(`1aa6720`) after this was found.
 
 ## The bench refuses to run
 
