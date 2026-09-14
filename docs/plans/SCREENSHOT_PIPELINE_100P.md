@@ -16,15 +16,20 @@ This document is the implementation plan; its waves are executed as dispatched s
 (corrections adopted in Phase 2); the remaining verifications and gap-fill axes died twice on
 5-hour session limits and are named in § Verification ledger, not bridged.
 Gap-fill reports B1, D2, E1 and F1 (with its addendum) are integrated below (2026-09-10 15:3x).
-Nothing in Phases 1–6 has been implemented yet. Hammerspoon was relaunched by hand at 00:20:18,
-displaced by a stray second instance at 12:03:36 (KB §F1b; two shots lost outright at 13:33), and
-relaunched again at 15:16:28 — still unsupervised.
+Hammerspoon was relaunched by hand at 00:20:18, displaced by a stray second instance at 12:03:36
+(KB §F1b; two shots lost outright at 13:33), and relaunched again at 15:16:28 — still unsupervised.
 **2026-09-13 (W2+W4, one dispatched session): Phase 1 IMPLEMENTED and proven live** — Hammerspoon
 runs under `org.hammerspoon.Hammerspoon.keepalive`; `supervise.sh --prove`: respawn 49 ms, detector
 downtime 565 ms, 1 instance; Login Item removed only after TCC was asserted on the launchd instance.
 **Phase 6 DONE the same session**: the fallback agent is retired in claude-infrastructure
 (`f0e75272b`, landed) and booted out on this box — details and the one resurrection path under its
-heading. W1 (Phases 2–5a) runs in parallel.
+heading.
+
+**🚀 W1 + W3 LANDED 2026-09-13 (Phases 2, 3, 4, 5a, 5b).** `init.lua` is a loader; every feature is
+a module under `hsc/`; `bench/` and `scripts/screenshot-bench.sh` exist and run. Per-phase status
+lines are inline below, and § W1 acceptance record carries what the wave measured — including three
+findings that correct this document. W2 landed Phase 1 and Phase 6 in parallel, so **failure class A
+is closed too**, and the W1 acceptance run was measured under that supervision.
 
 **Targets (acceptance, all measured by the bench in Phase 5 and by 7 days of real use):**
 
@@ -157,6 +162,13 @@ bench's thumbnail appears); TCC unchanged (same signed bundle, KB §F6).
 
 ## Phase 2 — Detection and copy: the dotfile is the file (W1)
 
+**STATUS: LANDED 2026-09-13** (`8cb973b`, `cbe893e`, `b68bf27`). Every step of the design below
+shipped as written except where § W1 acceptance record names a correction. Measured live at arm:
+`entries=3425 expect=3425 invariant=holds` — the corrected `size/32` predicate (step 2b(a)) is
+right on this volume, and the code prints both numbers exactly as this phase demanded. Idle
+listing rate is **1.00 per second** and nothing else, i.e. the backstop alone; **3.9–4.3 listings
+per shot** under bench load, inside the budget the decision log sets.
+
 **Why.** Failure class A/latency class A: Apple blocks on Spotlight AFTER the PNG is complete —
 **unboundedly, not for 10 s** (K1 refuters: 13.7 s and 29.4 s observed) — and the matcher waits for
 the rename (KB §F2). Measured: 10 ms `hs.timer` is stable (p99 11.0 ms); creation always changes the
@@ -287,6 +299,15 @@ uses `SIGSTOP` on the child for 3 s) shows `copied` before `renamed` by ≥ 2.9 
 
 ## Phase 3 — Nothing synchronous on the main thread (W1)
 
+**STATUS: LANDED 2026-09-13** (`f17a8af`, `b68bf27`). `hs.plist.read` replaces the python spawn;
+no `hs.execute`/`os.execute`/`io.popen`/`hs.osascript` survives anywhere (the two remaining
+out-of-process calls — the `screencapture` liveness test for a stranded dotfile and the
+`com.apple.screencapture` defaults read — are `hs.task`, asynchronous, off every latency path).
+The lazy-module warm at load shipped **and grew a fourth member the bench found**: `hs.pasteboard`
+was still being loaded on first ACCESS inside the copy path, and across three consecutive runs the
+first capture was the slowest every time (30.9 / 31.0 ms against a 26.1 ms worst case for the
+other nine). See § W1 acceptance record.
+
 **Why — RESTATED after F2's full audit (2026-09-11, live Hammerspoon at load 33–39); the original
 rationale was right in direction and wrong in magnitude.** The Dock rebind is **not** what blocks
 this pipeline: `com.apple.dock.plist` was written **twice in 24 h**, so `rebind()` runs ≈2×/day, and
@@ -330,6 +351,16 @@ latency. This is why the bench's stall test must assert on latency, not on loss.
 
 ## Phase 4 — Thumbnail: fastest visible, same guarantees (W1; numbers from E1 when it lands)
 
+**STATUS: LANDED 2026-09-13** (`8cb973b`, `cbe893e`). The slide is deleted, the canvas is built at
+its final position and entered with `hs.canvas:show(0.12)`, `phase=thumb-visible` comes from
+`isOccluded()`, screen frames are cached behind `hs.screen.watcher`, and every lifecycle fix from
+`664d809` / `e4713ad` / `8e0173a` / `85b003c` is ported as literal code with its comments (the
+"timer stops its own handle" lesson moved to the visibility probe, which is the only timer left).
+Measured on real keyboard shots: `thumb-shown` 6–24 ms after `copied`, `thumb-visible` 30–91 ms
+after that. **E1 §7's click-path rule was incomplete and is corrected** — see § W1 acceptance
+record — and **thumbnail visibility cannot be measured by an unattended bench at all**, because
+the 180 s idle gate guarantees a locked screen.
+
 **Design.** Keep hs.canvas and every lifecycle fix already learned (`:hide(seconds)` fade,
 per-canvas scoped callbacks, GC nudge on dismiss, pointer-display placement). Measured defect to
 fix (F1 §5.2): today `THUMB_SLIDE_DUR/THUMB_SLIDE_FPS` yields **3 frames**, the canvas is shown at
@@ -346,6 +377,13 @@ today. `behaviorAsLabels` adds `fullScreenAuxiliary` if the bench shows the canv
 fullscreen Space (unverified; KB §F8 item 10).
 
 ## Phase 5 — Structure and proof (W1 for the split, W3 for the bench)
+
+**STATUS: 5a and 5b LANDED 2026-09-13** (`e404ef5`, `f17a8af`, `d3028cd`, `2b87cc2`). The tree is
+as specified below with two deliberate departures, both noted in § W1 acceptance record: there is
+no `hsc/clock.lua` consumer outside `hsc/log.lua` (it exists, small, to keep the monotonic and wall
+clocks from being confused), and `bench/winprobe.swift` owns the pointer, the HID idle clock, the
+display/lock state and the pasteboard as well as the window list, because this box has no pyobjc
+and the alternative was a second native helper.
 
 **5a Module split** — adopted from the F1 report (scratchpad `reports/F1-module-structure.v1-08h46.md`,
 measured 2026-09-10). Three measured facts decide the shape:
@@ -495,6 +533,107 @@ service"), `~/Library/LaunchAgents/…screenshot-clipboard.plist` and `~/bin/scr
 
 ---
 
+## W1 acceptance record (2026-09-13) — what the wave measured, and what it corrects here
+
+Commits: `e404ef5` log/clock · `8cb973b` hsc/screenshot · `f17a8af` dock/apps/smartpaste ·
+`d3028cd` the loader · `cbe893e` path resolution across both renames · `2b87cc2` the bench ·
+`b68bf27` the performance work.
+
+### Two pre-landing gates closed, one of them by accident of instrumentation
+
+**Completeness critic item 3 is CLOSED, and Open question 1 with it.** The keyboard path's
+hidden-name lifecycle had never been observed live; the critic's warning was that W1 could
+otherwise "ship a detector that silently drops every real shot while the CLI bench prints
+`lost 0/300`". It did not need a `kqwatch` arm in the end: at **20:43:30** and **20:44:45** on
+2026-09-13 the operator took two ordinary ⌘⇧4 shots while the new pipeline was live, and the log
+caught one under **`.Screenshot 2026-09-13 at 8.43.29 PM.png`** (the complete second name, copied
+3.3 ms after first sight) and the other under
+**`..Screenshot 2026-09-13 at 8.44.44 PM.png-NKr8`** (the streaming temp, copied 40.7 ms after
+first sight, 27.0 ms after the PNG was complete) — both hidden forms, in the spelling KB §F2
+predicts, with `phase=renamed` arriving 0.3–0.5 s later in both cases. **Zero CLI captures were
+spent establishing this.** The premise is no longer validated only by the artifact built on it.
+
+**Critic items 7 and 9 are implemented.** `show-thumbnail` and `target` are read at module start
+through `hs.task` and WARNed on if they are anything but `0`/`file`; the clipboard's `changeCount`
+is re-checked 300 ms after every verified write and logs `phase=clobbered` when somebody else moved
+it. The clobber detector fired on its first bench run — on the bench's own clipboard *restore*,
+which is a true positive and exactly the class the check exists for.
+
+### Three findings that correct this document
+
+**1. E1 §7's click-path rule resolves only ONE of the two renames.** "Strip the leading dot(s) and
+make one inode check" handles `.Name.png → Name.png`, but the streaming temp is
+`..Name.png-XXXX` — dots *and* an mkstemp suffix — so a candidate caught under it resolved to
+nothing. Found by the very first bench capture, which copied correctly and then logged
+`no thumbnail (image could not be decoded)`. Fixed two ways, because either alone leaves a hole:
+the resolver also drops a trailing `-XXXX` after the extension, and the thumbnail now decodes
+`hs.pasteboard.readImage()` — the bytes just *proved* to be on the board — instead of a path that
+may already have been renamed out from under it. The click target stays a path, resolved by inode
+at click time, seconds later, when the final name certainly exists.
+
+**2. The Targets table's "10 ms poll + ≤ 1 ms PNG write + verify" budget was measured on the wrong
+pasteboard.** D2's sub-millisecond figure is a *private* board written from an AppKit process.
+Measured here through `hs.pasteboard`: write + read-back of 351 KB is **0.43 ms on a private board
+and 3–19 ms on the GENERAL one**, and 19.6 MB is 8.7 ms private. The difference is not size, it is
+that every write to the general board notifies this machine's clipboard observers. The p100 budget
+has to carry that term; it is the second-largest on the path after the file read.
+
+**3. 🚨 The unattended bench cannot measure thumbnail visibility AT ALL, and the reason is its own
+presence gate.** 180 s of idle is exactly what makes this Mac sleep the display and lock the
+screen — so the canvas is *genuinely* occluded behind the lock window, `isOccluded()` is right to
+keep saying so, and `phase=thumb-visible` never fires. Worse, polling for it was the single largest
+load the bench placed on the window server (150 `CGWindowListCopyWindowInfo` round trips per
+iteration, ending 1.5 s before the next capture), and that perturbation alone moved
+`png-complete→copied` **p100 between 26 and 53 ms across otherwise identical runs**. `winprobe`
+now reports `CGSSessionScreenIsLocked`, `run.py` records the metric as unmeasurable instead of
+polling for it, and `analyze.py` says so in the output. **Consequence for the Targets table: the
+`capture → thumbnail fully visible ≤ 200 ms p50` row cannot be certified by an unattended run and
+needs an operator-attended one** (`--min-idle 0` with somebody watching). The live keyboard shots
+above are the only real evidence so far: `thumb-shown` 6–24 ms after `copied`, `thumb-visible`
+30–91 ms after that.
+
+### The performance work, and one optimisation that was built and refuted
+
+The first passing configuration measured `png-complete→copied` p50 42.7 / p100 60.7 ms on ~8 MB
+captures. Four changes took it to **p50 ≈ 20 / p100 25.6–27.1 ms**, each one benched rather than
+reasoned about:
+
+| change | why | effect |
+|---|---|---|
+| a **sized** `f:read(size)` instead of `read("*a")` | `"*a"` cannot know the length, so Lua doubles a `luaL_Buffer` and copies through every realloc; 19.6 MB measured 24.83 / 8.46 / 9.98 ms against 2.61 / 3.23 / 3.14 ms sized | p50 42.7 → 25.9 ms |
+| **two rates, one timer**: settle every 5 ms, directory stat every 10 ms, settle first in the tick | once a candidate is open the only question is whether IEND has landed, and each tick of interval *T* adds *T*/2 on average to a 30 ms budget; an lseek + 8-byte read is 0.17 ms | p100 44.7 → 30.9 ms |
+| `hs.pasteboard` joins the warm list (F2 §9) | `hs` loads an extension on first ACCESS, and the copy path was paying for it: across three runs the FIRST capture was the slowest every time, 30.9 / 31.0 ms against a 26.1 ms worst case for the other nine | p100 30.9 → 29.8 ms |
+| the bench stops polling for an impossible answer (finding 3) | it was the largest load in its own measurement | p100 spread 26–53 → 25.6–27.1 ms |
+
+**Refuted, and recorded in `hsc/screenshot/settle.lua` so it is not re-attempted:** an *amortized*
+reader that takes each tick's new bytes as they land and concatenates at the end. The streaming
+temp is append-only, so it is sound — and it measured **p50 25.3 vs 25.9 ms (no change) and p100
+44.7 vs 39.1 ms (worse)**. The residual cost is I/O, not buffer growth: a **cold** 8.7 MB PNG reads
+in 11.12 ms through this path and a **warm** re-read of the same file in 2.96 ms, so the bytes
+genuinely have to come off the device and chunking only adds ~8 MB of garbage for the collector to
+walk at the worst possible moment.
+
+### Invariants confirmed live
+
+- `phase=armed dir=… entries=3425 expect=3425 invariant=holds size=109600` — the **corrected**
+  step 2b(a) predicate (`name count == st_size/32`, because `hs.fs.dir` yields `.` and `..`) is
+  right on this volume, and the code prints both numbers exactly as Phase 2 demanded rather than
+  assuming either. The watcher degrades to its full 10-tick bound if they ever disagree.
+- **Idle listing rate 1.00 per second and nothing else** — the backstop alone, with `ticks` climbing
+  at ~98/s on the 10 ms directory poll (12 591 ticks over 128.77 s of uptime). Under bench load:
+  **3.9–4.3 listings per shot**, inside the decision log's budget.
+- **`phase=renamed` routinely lands seconds after `phase=copied`** — the whole point of the phase,
+  visible in the log on every shot.
+
+### Still open after W1 + W3
+
+Critic items **1, 2, 6, 8 and 10** are untouched and owned by W2/W4/W5. Item **11** is partly
+addressed — the bench samples a full-display capture every 20 iterations and `analyze.py` reports
+percentiles per size band — but the *base* band is now the pessimistic end of the distribution
+rather than the p85 image, because a locked screen's photographic wallpaper compresses to ~8 MB
+where a UI screenshot of the same geometry is ~2.4 MB. **Phase 1 and Phase 6 are not implemented**,
+so failure class A stands: nothing restarts Hammerspoon.
+
 ## Decision log (why, so a successor does not re-litigate)
 
 - **File-watch stays the architecture; the dotfile is the file.** The system hotkey is the only
@@ -542,6 +681,21 @@ service"), `~/Library/LaunchAgents/…screenshot-clipboard.plist` and `~/bin/scr
   older-over-newer race in place, and supervision makes its window ~2 s.
 - **Hotkey takeover rejected** (dead key when Hammerspoon is dead; spawner nag), **native capture
   rejected** (loses the crosshair/magnifier/window mode), **FSEvents rejected** (2026-09-08).
+- **The settle runs at 5 ms while the directory poll stays at 10 ms (W1, measured).** These are
+  different questions: detection asks "is there a new entry", which the 10 ms interval was
+  benchmarked for, while the settle asks "has IEND landed on a file I already hold open", which
+  costs an lseek and 8 bytes. Giving both the same interval spent 10 ms of a 30 ms budget on the
+  cheaper question. One timer at 5 ms, the directory stat every second tick, settle first.
+- **The thumbnail decodes the pasteboard, not a path (W1).** A capture wears three names while we
+  hold it; the one it was caught under may be gone by the time anything decodes. `readImage()` uses
+  the bytes we just verified, and the click target is resolved by inode at click time instead.
+- **An amortized reader was built and refuted (W1).** See § W1 acceptance record — the residual
+  cost is I/O, not Lua buffer growth, and the chunked version measured worse at p100. Do not
+  re-open it without a measurement that beats 19.9 ms p50 / 27.1 ms p100 on ~8 MB captures.
+- **The bench records thumbnail visibility as UNMEASURABLE rather than polling for it (W1).** Its
+  own 180 s presence gate is what locks the screen, so the canvas is genuinely occluded and no
+  amount of polling can produce the answer — while the polling itself was the largest load in the
+  measurement. That target now needs an operator-attended run.
 
 ## Verification ledger (updated as the wave lands)
 
@@ -618,7 +772,12 @@ under Phase 6's status and stays owned by item 6's auditor.
 
 ## Open questions (owner, closing action)
 
-1. Keyboard-path temp spelling — W1 (log the first real shot's names after landing).
+1. ~~Keyboard-path temp spelling — W1 (log the first real shot's names after landing).~~
+   **ANSWERED 2026-09-13, and by two real shots rather than one.** Both hidden forms were observed
+   live by the landed pipeline — `.Screenshot 2026-09-13 at 8.43.29 PM.png` and
+   `..Screenshot 2026-09-13 at 8.44.44 PM.png-NKr8` — in the spelling KB §F2 predicts, with
+   `renamed` following 0.3–0.5 s later. This also closes completeness critic item 3. See
+   § W1 acceptance record.
 2. Clipboard destination skips `mds`? — W5 experiment 1 (operator presses Ctrl+⌘⇧4 once).
 3. `fullScreenAuxiliary` over fullscreen Spaces — W3 bench.
 4. What loads `mds` — B1 (pending), then claude-infrastructure.
