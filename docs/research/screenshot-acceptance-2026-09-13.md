@@ -154,6 +154,29 @@ capture, and both versions produced `renamed − copied` of 0.28–0.74 s, i.e. 
 delay and no stall at all). Triggering off the pipeline's own `copied` line costs nothing and
 cannot miss.
 
+### 🚨 One thing this session found that is NOT W1's to fix: an 88 s gap after a SIGTRAP
+
+`supervise.sh status` reads `verdict=supervised` with the W1 pipeline live, and its heartbeat check
+already accepts this wave's `phase=armed` line — the two waves integrate cleanly. But the job also
+reports `runs = 2` and `last terminating signal = Trace/BPT trap: 5`, i.e. **Hammerspoon died once
+during this session with SIGTRAP** — the `EXC_BREAKPOINT`-in-`hs.ipc` class that killed the config
+on 2026-09-10 at 12:03:36 — and the log shows the gap:
+
+```
+ts=2026-09-13T21:00:15.046  phase=error  msg=…/hs/ipc.lua:81: ipc port is no longer valid (early)
+ts=2026-09-13T21:01:43.370  phase=start  module=init      ← 88.3 s later
+```
+
+**88.3 s with no screenshot detection at all**, against Phase 1's ≤ 2 s downtime target. What is
+certain: the crash signature is the hs.ipc one, it was provoked by this session hammering
+`hs -c 'hs.reload()'` under bench load rather than by ordinary use, `runs = 2` accounts for exactly
+one respawn, and the acceptance run began at 21:15:40, well clear of it. **What is NOT resolved is
+why the gap was 88 s when a mature job re-forks in ~1 ms** — that is a supervision question, in
+W2's files, which this wave is forbidden to touch. It is recorded here rather than swallowed
+because it is the one measured breach of a Phase 1 acceptance row, and because it shows the hs.ipc
+crash class is still live: nothing in W1 can stop a Hammerspoon *extension* from printing through a
+stale port, so supervision is what covers it.
+
 ### What this run did NOT exercise
 
 - **The Apple stall.** 0 of 197 captures stalled ≥ 1 s, against a 30-day user baseline of 2.6 %.

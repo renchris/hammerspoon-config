@@ -339,6 +339,7 @@ intercept or modify the capture behavior itself.
 Note that the tap **self-heals**: `libeventtap.m` re-enables on both
 `kCGEventTapDisabledByTimeout` and `…ByUserInput`, so a long main-thread stall drops events
 during it but never leaves the tap permanently dead.
+
 ## Hammerspoon is supervised by launchd (since 2026-09-13)
 
 **What changed**: Hammerspoon is no longer a Login Item. The user agent
