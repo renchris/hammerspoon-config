@@ -154,28 +154,34 @@ capture, and both versions produced `renamed − copied` of 0.28–0.74 s, i.e. 
 delay and no stall at all). Triggering off the pipeline's own `copied` line costs nothing and
 cannot miss.
 
-### 🚨 One thing this session found that is NOT W1's to fix: an 88 s gap after a SIGTRAP
+### 🚨 Hammerspoon crashed once during this session, and the trigger is W1's to own
 
 `supervise.sh status` reads `verdict=supervised` with the W1 pipeline live, and its heartbeat check
-already accepts this wave's `phase=armed` line — the two waves integrate cleanly. But the job also
-reports `runs = 2` and `last terminating signal = Trace/BPT trap: 5`, i.e. **Hammerspoon died once
-during this session with SIGTRAP** — the `EXC_BREAKPOINT`-in-`hs.ipc` class that killed the config
-on 2026-09-10 at 12:03:36 — and the log shows the gap:
+already accepts this wave's `phase=armed` line — the two waves integrate cleanly. They also caught
+the same incident from opposite ends, and **W2's instrument is the right one**:
 
-```
-ts=2026-09-13T21:00:15.046  phase=error  msg=…/hs/ipc.lua:81: ipc port is no longer valid (early)
-ts=2026-09-13T21:01:43.370  phase=start  module=init      ← 88.3 s later
-```
-
-**88.3 s with no screenshot detection at all**, against Phase 1's ≤ 2 s downtime target. What is
-certain: the crash signature is the hs.ipc one, it was provoked by this session hammering
-`hs -c 'hs.reload()'` under bench load rather than by ordinary use, `runs = 2` accounts for exactly
-one respawn, and the acceptance run began at 21:15:40, well clear of it. **What is NOT resolved is
-why the gap was 88 s when a mature job re-forks in ~1 ms** — that is a supervision question, in
-W2's files, which this wave is forbidden to touch. It is recorded here rather than swallowed
-because it is the one measured breach of a Phase 1 acceptance row, and because it shows the hs.ipc
-crash class is still live: nothing in W1 can stop a Hammerspoon *extension* from printing through a
-stale port, so supervision is what covers it.
+- **What happened.** At **21:01:43** the launchd instance — running this config through the symlink,
+  mid-bench — died of `EXC_BREAKPOINT` in `CFMessagePortSendRequest` ← `libipc ipc_sendMessage`
+  (`~/Library/Logs/DiagnosticReports/Hammerspoon-2026-09-13-210146.ips`), the **same hs.ipc crash
+  class as 2026-09-10 12:03:36**. KeepAlive re-forked it and the watcher logged `phase=armed` at
+  21:01:43.794: **~0.7 s crash → armed, unattended.** Before Phase 1 the identical crash meant hours
+  dead.
+- **A correction to what this document said first.** An earlier revision read the 88 s between
+  `phase=error … ipc.lua:81` at 21:00:15 and the next `phase=start` at 21:01:43 as *88 s of
+  downtime, a breach of Phase 1's ≤ 2 s row*. It is not: the crash report puts the crash **at**
+  21:01:43, so those 88 s are the interval between the warning and the fault, with the config
+  running normally throughout, and the downtime is 0.7 s. **The log alone could not tell those two
+  readings apart** — `phase=start` looks the same whether it follows a reload or a respawn — and the
+  crash report is what separates them. Recorded because the wrong reading was the obvious one.
+- **🚨 The trigger is ours, and it is specific: never abandon an `hs -c` call.** The fault is
+  Hammerspoon replying to a CLI client's message port after the client has gone, and what makes a
+  client go away mid-reply is `timeout N hs -c …` — which this session ran dozens of times while
+  syntax-checking Lua through the live instance, each retry leaving another dead port. **The shipped
+  bench never does it**: every `hs -c` in `scripts/screenshot-bench.sh` is unguarded by `timeout`
+  and falls back with `|| true` on failure rather than being killed. So the risk is a development
+  habit, not a shipped one — but W1 owns the Lua side of the crash class, nothing in this config can
+  stop a Hammerspoon *extension* from writing through a stale port, and supervision is what covers
+  the residue.
 
 ### What this run did NOT exercise
 

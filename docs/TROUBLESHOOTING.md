@@ -295,6 +295,15 @@ hs.ipc's logger, taking every feature with it.
 If you see these lines with NO reload nearby, that is different and worth reading: check
 `hs -c 'return hsc()._ipc'`, which is false when another instance owns the port.
 
+🚨 **Never wrap `hs -c` in `timeout`.** The lines above are survivable; the crash that follows them
+is not. On 2026-09-13 at 21:01:43 the live instance died of `EXC_BREAKPOINT` in
+`CFMessagePortSendRequest` ← `libipc ipc_sendMessage` — Hammerspoon replying to a CLI client's
+message port after the client had gone — and what makes a client go away mid-reply is exactly
+`timeout N hs -c …`, which that session had been running dozens of times to syntax-check Lua.
+launchd re-forked it and the watcher re-armed in 0.7 s, so the cost was small; before supervision
+the identical crash meant hours dead. Let an `hs -c` call finish, or do not start it. Nothing in
+`scripts/screenshot-bench.sh` wraps one.
+
 ## The bench refuses to run
 
 **Symptom**: `ABORT: operator present (idle 12s < 180s required)`, or
