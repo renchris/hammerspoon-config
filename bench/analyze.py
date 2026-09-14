@@ -108,7 +108,11 @@ def main():
     if disagreements:
         add(f"🚨 {len(disagreements)} iteration(s) where the prober disagreed with "
             f"thumb-visible by > 100 ms")
-    if no_thumb:
+    if data.get("screen_locked"):
+        add("note: the screen was LOCKED — capture→thumb-visible is UNMEASURABLE in this run "
+            "(the canvas is genuinely occluded behind the lock window, and isOccluded() is right "
+            "to say so); the latency and reliability numbers are unaffected")
+    elif no_thumb:
         add(f"note: {len(no_thumb)} copied shot(s) logged no thumb-visible line")
 
     verdict = []

@@ -27,11 +27,14 @@ PROBE_BIN="$REPO/bench/winprobe"
 
 N=300
 QUICK=0
+MIN_IDLE=180
+GATE_WAIT=${GATE_WAIT:-600}
 EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quick) QUICK=1; N="${2:-10}"; shift 2 ;;
     --no-relink) RELINK=0; shift ;;
+    --min-idle) MIN_IDLE="$2"; EXTRA+=(--min-idle "$2"); shift 2 ;;
     -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
     [0-9]*) N="$1"; shift ;;
     *) EXTRA+=("$1"); shift ;;
@@ -55,6 +58,49 @@ if [[ ! -x "$PROBE_BIN" || "$PROBE_SRC" -nt "$PROBE_BIN" ]]; then
   swiftc -O -o "$PROBE_BIN" "$PROBE_SRC"
 fi
 
+# ---------------------------------------------------------------------------- display
+# 🚨 THE IDLE GATE AND THE DISPLAY FIGHT EACH OTHER, AND THE DISPLAY WINS BY DEFAULT.  The bench
+# may not start until the machine has been idle 180 s — but this Mac's display sleeps inside that
+# window, and an asleep display makes `screencapture` exit 1 having written nothing at all
+# (measured: "could not create image from display with rect …", both of the knowledge base's own
+# capture probes, and this bench's first --quick 10 attempt).  So the run HOLDS `caffeinate -d`
+# for its whole lifetime.  It asserts the display assertion only; it posts no events, so the idle
+# clock keeps climbing underneath it and the presence gate still means what it says.
+CAFFEINATE_PID=""
+start_caffeinate() {
+  caffeinate -d -i -w $$ &
+  CAFFEINATE_PID=$!
+  note "holding caffeinate -d (pid $CAFFEINATE_PID) for the duration"
+}
+stop_caffeinate() { [[ -n "$CAFFEINATE_PID" ]] && kill "$CAFFEINATE_PID" 2>/dev/null; }
+start_caffeinate
+
+display_asleep() {
+  printf 'display\nquit\n' | "$PROBE_BIN" | \
+    /usr/bin/python3 -c 'import sys,json; print("1" if json.loads(sys.stdin.readline())["asleep"] else "0")' 2>/dev/null
+}
+read_idle() {
+  printf 'idle\nquit\n' | "$PROBE_BIN" | \
+    /usr/bin/python3 -c 'import sys,json; print(int(json.loads(sys.stdin.readline())["idle"]))' 2>/dev/null
+}
+if [[ "$(display_asleep)" == "1" ]]; then
+  # Waking it necessarily resets the idle clock — there is no way to wake a display without
+  # declaring user activity — so the run serves the presence gate again.  With -d held it will
+  # not sleep a second time, which is what makes the second wait terminate.
+  note "display asleep; waking it (this resets the idle clock, so the gate is re-served)"
+  caffeinate -u -t 1
+  sleep 2
+  gate_deadline=$(( $(date +%s) + GATE_WAIT ))
+  while [[ "$(read_idle)" -lt "$MIN_IDLE" ]]; do
+    if [[ "$(date +%s)" -ge "$gate_deadline" ]]; then
+      note "ABORT: idle never reached ${MIN_IDLE}s within ${GATE_WAIT}s — the operator is present"
+      exit 3
+    fi
+    sleep 10
+  done
+  note "idle gate re-served at $(read_idle)s"
+fi
+
 # ---------------------------------------------------------------------------- symlink
 ORIGINAL=""
 restore_link() {
@@ -66,7 +112,7 @@ restore_link() {
     sleep 3
   fi
 }
-trap restore_link EXIT INT TERM
+trap 'restore_link; stop_caffeinate' EXIT INT TERM
 
 if [[ "$RELINK" == "1" ]]; then
   if [[ -L "$LINK" ]]; then
@@ -89,8 +135,12 @@ fi
 # ---------------------------------------------------------------------------- bench mode
 hs -c 'return require("hsc.screenshot").benchMode(true)' >/dev/null 2>&1 || \
   note "WARNING: could not enter bench mode over hs.ipc (an unreliable transport under load)"
-LISTINGS_BEFORE=$(hs -c 'local s=require("hsc.screenshot").stats(); return tostring(s.watcher and s.watcher.listings or 0)' 2>/dev/null | tail -1 | tr -dc '0-9')
-SHOTS_BEFORE=$(hs -c 'local s=require("hsc.screenshot").stats(); return tostring(s.counts.created or 0)' 2>/dev/null | tail -1 | tr -dc '0-9')
+# math.floor before tostring: hs returns Lua numbers as floats ("128.0"), and stripping
+# non-digits from that yields 1280 — which is how a listings-per-shot of -230.00 got printed.
+counter() { hs -c "local s=require('hsc.screenshot').stats(); return tostring(math.floor($1))" 2>/dev/null \
+              | grep -a -oE '^[0-9]+$' | tail -1; }
+LISTINGS_BEFORE=$(counter "(s.watcher and s.watcher.listings) or 0")
+SHOTS_BEFORE=$(counter "s.counts.created or 0")
 
 # ---------------------------------------------------------------------------- run
 RECORDS="/tmp/screenshot-bench-records-$$.json"
@@ -106,13 +156,15 @@ if [[ ! -s "$RECORDS" ]]; then
   exit "$RC"
 fi
 
-LISTINGS_AFTER=$(hs -c 'local s=require("hsc.screenshot").stats(); return tostring(s.watcher and s.watcher.listings or 0)' 2>/dev/null | tail -1 | tr -dc '0-9')
-SHOTS_AFTER=$(hs -c 'local s=require("hsc.screenshot").stats(); return tostring(s.counts.created or 0)' 2>/dev/null | tail -1 | tr -dc '0-9')
+LISTINGS_AFTER=$(counter "(s.watcher and s.watcher.listings) or 0")
+SHOTS_AFTER=$(counter "s.counts.created or 0")
 LPS_ARG=()
 if [[ -n "${LISTINGS_BEFORE:-}" && -n "${LISTINGS_AFTER:-}" && -n "${SHOTS_BEFORE:-}" && -n "${SHOTS_AFTER:-}" ]]; then
+  # A reload mid-run zeroes both counters, which would print a meaningless (often negative)
+  # figure; report nothing rather than a number that is not a measurement.
   LPS=$(python3 -c "
 b,a,sb,sa=$LISTINGS_BEFORE,$LISTINGS_AFTER,$SHOTS_BEFORE,$SHOTS_AFTER
-print(f'{(a-b)/max(1,sa-sb):.2f}')" 2>/dev/null || true)
+print(f'{(a-b)/(sa-sb):.2f}' if a>=b and sa>sb else '')" 2>/dev/null || true)
   [[ -n "$LPS" ]] && LPS_ARG=(--listings-per-shot "$LPS")
 fi
 

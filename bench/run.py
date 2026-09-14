@@ -127,6 +127,12 @@ def preflight(args, probe):
         problems.append(f"{args.dir} is not a writable directory")
     if not os.path.exists(args.log):
         problems.append(f"{args.log} does not exist — is the pipeline running?")
+    # An asleep display is exit 1 with nothing written, and that path never touches Spotlight —
+    # so it is a PRECONDITION, tested here, not a result to be discovered on the first capture.
+    disp = probe.cmd("display")
+    if disp.get("asleep") or disp.get("displays", 0) < 1:
+        problems.append("the display is asleep (screencapture would exit 1 writing nothing) — "
+                        "hold `caffeinate -d` before the idle window opens")
     return problems, n
 
 
@@ -200,6 +206,15 @@ def main():
     # PRESENCE GATE.  The bench takes screenshots of the operator's live desk and owns the general
     # pasteboard for the duration; running it while they are working is both a perturbation and a
     # measurement error.
+    # A locked screen makes thumbnail visibility unobservable — and polling for it anyway is not
+    # merely useless, it is the largest load the bench puts on the window server: 150 round trips
+    # per iteration that cannot succeed, ending 1.5 s before the next capture. Measured, that
+    # perturbation moved png-complete→copied p100 between 26 and 53 ms across otherwise identical
+    # runs. The metric is recorded as unmeasurable instead.
+    locked = bool(probe.cmd("display").get("locked"))
+    if locked:
+        log("screen is LOCKED — thumb-visible is unobservable this run and will not be polled")
+
     idle = probe.cmd("idle")["idle"]
     if idle < args.min_idle:
         log(f"ABORT: operator present (idle {idle:.0f}s < {args.min_idle:.0f}s required)")
@@ -296,15 +311,20 @@ def main():
                 rec["board_len"] = board["len"]
                 rec["bytes_match"] = (board["len"] == st.st_size and board["sha1"] == sha_file)
 
-                # The falsifier.  Poll for geometric visibility and compare with the in-process line.
-                vis_end = time.monotonic() + 1.5
+                # The falsifier.  Poll for geometric visibility and compare with the in-process
+                # line — but only while an answer is possible, and only until the in-process line
+                # has already been corroborated.
                 seen = None
-                while time.monotonic() < vis_end:
-                    p = probe.cmd("probe")
-                    if p["visible"]:
-                        seen = p["t"]
-                        break
-                    time.sleep(0.01)
+                if locked:
+                    rec["thumb_unmeasurable"] = "screen-locked"
+                else:
+                    vis_end = time.monotonic() + 1.0
+                    while time.monotonic() < vis_end:
+                        p = probe.cmd("probe")
+                        if p["visible"]:
+                            seen = p["t"]
+                            break
+                        time.sleep(0.02)
                 rec["probe_visible_mono"] = seen
                 if seen and "thumb-visible" in phases:
                     rec["probe_disagreement_ms"] = abs(seen - phases["thumb-visible"]) / 1e6
@@ -341,6 +361,7 @@ def main():
 
     payload = {
         "run_id": run_id, "requested": args.n, "completed": len(records),
+        "screen_locked": locked,
         "aborted": aborted, "mode": "bench", "spacing_s": args.spacing,
         "min_idle_s": args.min_idle, "deadline_s": args.deadline,
         "hammerspoon_instances": hs_n,

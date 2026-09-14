@@ -27,7 +27,9 @@ local M = {}
 
 local cfg = {
   dir            = os.getenv("HOME") .. "/Screenshots",
-  pollS          = 0.010,   -- C1: first-name detection p50 4.7 / p90 10.0 / p99 11.1 ms, 35/35 caught
+  pollS          = 0.005,   -- the TIMER interval; the directory is stat'd every other tick
+  settleEvery    = 1,       -- settle on every tick — see the comment on the timer below
+  dirEvery       = 2,       -- ...and stat the directory on every second one, i.e. the 10 ms poll
   backstopS      = 1.0,     -- the net-zero-tick backstop; one listing/s, 2.4 ms, ~0.24 % of a core
   reconcileMax   = 10,      -- bound on the re-list loop after a size change
   creationWindow = 30,      -- a candidate must have been created within this many seconds
@@ -336,6 +338,11 @@ end
 --- Warm the lazy modules ONCE, at load.  hs.mouse/hs.screen/hs.sound/hs.canvas are otherwise first
 --- touched inside the settle path, so the FIRST screenshot after every Hammerspoon launch pays
 --- ~20–40 ms of module loading on the user's latency path — and this box relaunches often (F2 §9).
+--- ...and `hs.pasteboard` belongs on that list, which the bench proved rather than assumed: over
+--- three consecutive 10-sample runs the FIRST capture was the slowest every time (30.9 / 31.0 ms
+--- against a 26.1 ms worst case for the other nine), because `hs` loads an extension on first
+--- ACCESS and the copy path's first touch of hs.pasteboard was paying for it on the user's
+--- latency. Reading `changeCount` and `contentTypes` costs microseconds and writes nothing.
 local function warmModules()
   pcall(function()
     hs.mouse.absolutePosition()
@@ -344,6 +351,9 @@ local function warmModules()
     local c = hs.canvas.new({ x = 0, y = 0, w = 1, h = 1 })
     if c then c:delete() end
     hs.image.imageFromName("NSApplicationIcon")
+    hs.pasteboard.changeCount()
+    hs.pasteboard.contentTypes()
+    hs.task.new("/usr/bin/true", nil):start()
   end)
 end
 
@@ -364,10 +374,24 @@ function M.start(userCfg)
   -- continueOnError = true.  hs.timer.new defaults to STOPPING the timer on the first Lua error in
   -- its callback, which would turn a transient fault into a silent, permanent loss of detection —
   -- the exact failure shape this rewrite exists to remove.
+  -- 🚨 TWO RATES, ONE TIMER.  Detection wants a 10 ms directory stat — that is the interval C1
+  -- benchmarked (first-name detection p50 4.705 / p90 10.011 / p99 11.050 ms, 35/35 caught) and
+  -- the one the whole design is costed against.  The SETTLE wants to be faster than that, because
+  -- once a candidate is open the only question left is "has IEND landed yet", and every tick of
+  -- interval T adds T/2 on average and T at worst to the answer — measurably, on a path whose
+  -- total budget is 30 ms.  An lseek plus an 8-byte read is ~0.17 ms, so running it at 5 ms while
+  -- something is pending costs nothing and halves that term.  One timer at 5 ms, the directory
+  -- stat every second tick, keeps the poll exactly as designed and does not double the listings.
+  local tickN = 0
   state.timer = hs.timer.new(cfg.pollS, function()
     local ok, err = pcall(function()
-      if state.w then state.w:tick() end
+      tickN = tickN + 1
+      -- Settle FIRST, discovery second.  On a directory tick the watcher may re-list (2.4 ms for
+      -- this directory, and up to the reconcile bound after a size change), and a candidate that
+      -- finished during the previous interval would otherwise wait behind that listing for no
+      -- reason: the bytes it needs are already on disk.  Ordering is free and the term is not.
       settleTick()
+      if state.w and (tickN % cfg.dirEvery == 0) then state.w:tick() end
     end)
     if not ok then log.error("tick", { msg = tostring(err) }) end
   end, true)
@@ -378,7 +402,8 @@ function M.start(userCfg)
 
   checkCaptureDefaults()
   state.started = true
-  log.emit("start", { module = "screenshot", poll_ms = cfg.pollS * 1000,
+  log.emit("start", { module = "screenshot", poll_ms = cfg.pollS * 1000 * cfg.dirEvery,
+                      settle_ms = cfg.pollS * 1000,
                       backstop_s = cfg.backstopS, cap_s = cfg.settleCapS, dir = cfg.dir })
   return true
 end
@@ -419,7 +444,8 @@ function M.stats()
     watcher = state.w and state.w:stats() or nil,
     thumbnail = thumbnail.stats(),
     log = log.stats(),
-    config = { poll_ms = cfg.pollS * 1000, backstop_s = cfg.backstopS, cap_s = cfg.settleCapS,
+    config = { poll_ms = cfg.pollS * 1000 * cfg.dirEvery, settle_ms = cfg.pollS * 1000,
+               backstop_s = cfg.backstopS, cap_s = cfg.settleCapS,
                creation_window_s = cfg.creationWindow, retro_s = cfg.retroWindow, tiff = cfg.tiff },
   }
 end

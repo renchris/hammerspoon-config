@@ -26,7 +26,7 @@ local M = {}
 M.PNG_SIG  = "\137\80\78\71\13\10\26\10"        -- \x89 P N G \r \n \x1a \n
 M.PNG_IEND = "\73\69\78\68\174\66\96\130"       -- "IEND" + CRC 0xAE426082
 
---- One settle iteration for candidate `c` (fields: fh, and the mutable size/isPng scratch).
+--- One settle iteration for candidate `c` (fields: fh, plus the size/isPng scratch).
 --- Returns one of:
 ---   "wait"     — still being written
 ---   "complete" — IEND present; the bytes are final
@@ -59,16 +59,35 @@ function M.step(c)
   return "wait"
 end
 
---- Read the complete file through the same handle (3 ms for 2.4 MB).  Returns bytes or nil.
---- The length is re-checked against the size `step` saw: if the file grew between the IEND check
---- and this read we are looking at a different image, and one retry re-reads it whole.
+--- Read the complete file through the same handle.  Returns bytes or nil.
+---
+--- 🚨 A SIZED READ, NOT `read("*a")`.  `read("*a")` cannot know the length in advance, so Lua
+--- grows a luaL_Buffer by doubling and copies the data through every reallocation.  Measured on a
+--- 19.6 MB PNG through this exact path: **24.83 / 8.46 / 9.98 ms for "*a" against 2.61 / 3.23 /
+--- 3.14 ms sized**, and live it cut the bench's png-complete→copied p50 from 42.7 ms to 25.9 ms.
+--- The size is already known: `step` read it off the handle to find IEND.
+---
+--- 🚨 AND IT IS ONE READ AT THE END, NOT AN AMORTIZED ONE — the obvious optimisation was BUILT AND
+--- REFUTED (2026-09-13).  The streaming temp is append-only, so each tick could take whatever had
+--- landed since the last one and leave only a concat for the moment that matters; it was
+--- implemented and benched at 10 samples against this version and came out **p50 25.3 vs 25.9 ms
+--- (no change) and p100 44.7 vs 39.1 ms (worse)**.  The reason is that the residual cost is I/O and
+--- not buffer growth: a *cold* 8.7 MB PNG reads in 11.12 ms through this path and a warm re-read of
+--- the same file in 2.96 ms, so the bytes genuinely have to come off the device, and chunking them
+--- only adds ~8 MB of intermediate garbage for the collector to walk at exactly the wrong moment.
+--- The simpler code performs the same; do not re-introduce the chunked reader without a
+--- measurement that beats these numbers.
+---
+--- The length is re-checked against what `step` saw: if the file grew between the IEND check and
+--- this read we are looking at a different image, and one retry re-reads it whole.
 function M.readAll(c)
   for _ = 1, 2 do
-    c.fh:seek("set", 0)
-    local data = c.fh:read("*a")
-    if data and #data >= 8 and data:sub(-8) == M.PNG_IEND then return data end
     local ok, size = pcall(function() return c.fh:seek("end") end)
-    if ok and size then c.size = size end
+    if not ok or not size then return nil end
+    c.size = size
+    c.fh:seek("set", 0)
+    local data = c.fh:read(size)
+    if data and #data == size and #data >= 8 and data:sub(-8) == M.PNG_IEND then return data end
   end
   return nil
 end

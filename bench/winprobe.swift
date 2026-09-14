@@ -16,6 +16,7 @@
 //   probe            -> {"t":<mono ns>,"visible":bool,"frac":f,"n":windows,"bounds":[x,y,w,h]}
 //   pointer          -> {"t":...,"x":f,"y":f}
 //   idle             -> {"t":...,"idle":seconds}
+//   display          -> {"t":...,"asleep":bool,"displays":n,"locked":bool}
 //   ccount           -> {"t":...,"cc":n}
 //   pngsha           -> {"t":...,"len":n,"sha1":"..."}  (public.png on the general pasteboard)
 //   snapshot <path>  -> {"ok":bool,"items":n,"types":[...]}   refuses a multi-item board
@@ -148,6 +149,21 @@ while let line = readLine(strippingNewline: true) {
     case "idle":
         let s = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .init(rawValue: ~0)!)
         emit(["t": monoNs(), "idle": s])
+    case "display":
+        // An asleep display makes screencapture exit 1 having written nothing, and that is NOT a
+        // pipeline failure — it is a precondition the bench has to test rather than discover.
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        // A LOCKED screen is not an error, but it does make thumbnail visibility unobservable:
+        // the canvas is genuinely occluded behind the lock window, so isOccluded() is right to say
+        // so and the prober is right to agree. The bench needs to know, so it can record the
+        // metric as unmeasurable instead of polling 150 times a shot for an answer that cannot come.
+        var locked = false
+        if let d = CGSessionCopyCurrentDictionary() as? [String: Any] {
+            locked = (d["CGSSessionScreenIsLocked"] as? Int ?? 0) != 0
+        }
+        emit(["t": monoNs(), "asleep": CGDisplayIsAsleep(CGMainDisplayID()) != 0,
+              "displays": Int(count), "locked": locked])
     case "ccount":  emit(["t": monoNs(), "cc": NSPasteboard.general.changeCount])
     case "pngsha":  emit(pngsha())
     case "snapshot": emit(snapshot(arg))
