@@ -120,7 +120,12 @@ still sends to a dead `hs -c` client's port. KeepAlive re-forked it and the watc
 `phase=armed` at 21:01:43.794 — **~0.7 s crash → armed, no human involved**; `status` showed
 `launchd_runs=2`, `launchd_last_terminating_signal=Trace/BPT trap: 5`. Before this phase the same
 crash meant hours dead. 🚨 **Owner W1**: the crash class is still live under the new config; a
-shipped `hs -c`-heavy bench will keep triggering it.
+shipped `hs -c`-heavy bench will keep triggering it. **RESOLVED the same evening (W1, `46c227d`):
+the trigger is an `hs -c` client killed mid-reply by an EXTERNAL timeout** (W1's own
+`timeout N hs -c` syntax checks) — Hammerspoon then replies to a dead port. The shipped bench never
+wraps `hs -c`. `supervise.sh`/`install.sh` had the same shape (a perl `alarm` around `hs -c`) and now
+rely on `hs -t 4` instead (`fix: never wrap hs -c in an external timeout…`). Rule: **bound `hs -c`
+with its own `-t`, never with `timeout`/`alarm`/`kill`.**
 
 **Why.** Failure class A: SIGTERMed 2026-09-09 18:55:16 by a fleet census, dead 5.4 h, nothing
 relaunched it (KB §F1). The fleet has killed processes by pattern three times before. Measured:
