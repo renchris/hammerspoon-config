@@ -10,7 +10,7 @@
 -- THE ORDER OF OPERATIONS IS ITSELF A DESIGN DECISION, measured end to end:
 --     poll (10 ms, st_size only) → open the handle at first sight → settle to IEND through the
 --     handle → read the bytes → VERIFIED PNG-only pasteboard write → record the inode as copied →
---     decode → thumbnail → Pop.
+--     decode → thumbnail.
 -- The clipboard is reached BEFORE any hs.image decode, because the PNG bytes need no decode to be
 -- pasteable and the decode is ~47 ms for a 2.4 MB capture at 2× (E1 §5) — decoding first delayed
 -- every large shot's ⌘V for nothing.  The inode is recorded as copied only AFTER the write is
@@ -335,7 +335,7 @@ local function checkCaptureDefaults()
   end, { "read", "com.apple.screencapture" }):start()
 end
 
---- Warm the lazy modules ONCE, at load.  hs.mouse/hs.screen/hs.sound/hs.canvas are otherwise first
+--- Warm the lazy modules ONCE, at load.  hs.mouse/hs.screen/hs.canvas are otherwise first
 --- touched inside the settle path, so the FIRST screenshot after every Hammerspoon launch pays
 --- ~20–40 ms of module loading on the user's latency path — and this box relaunches often (F2 §9).
 --- ...and `hs.pasteboard` belongs on that list, which the bench proved rather than assumed: over
@@ -347,7 +347,6 @@ local function warmModules()
   pcall(function()
     hs.mouse.absolutePosition()
     hs.screen.allScreens()
-    hs.sound.getByName("Pop")
     local c = hs.canvas.new({ x = 0, y = 0, w = 1, h = 1 })
     if c then c:delete() end
     hs.image.imageFromName("NSApplicationIcon")
@@ -421,11 +420,10 @@ function M.stop()
   state.started = false
 end
 
---- Bench mode: no sound, a short dismissal.  `analyze.py` records the mode and never compares
+--- Bench mode: a short dismissal.  `analyze.py` records the mode and never compares
 --- percentiles across modes.
 function M.benchMode(on)
-  thumbnail.start({ config = on and { sound = false, dismiss = 0.4 }
-                               or { sound = true,  dismiss = 3 } })
+  thumbnail.start({ config = { dismiss = on and 0.4 or 3 } })
   return on and "bench" or "normal"
 end
 

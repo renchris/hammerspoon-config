@@ -53,7 +53,7 @@ so a rename between two polls costs nothing.
 | 3. Poll notices the new entry | Hammerspoon `stat` every 10 ms | p50 4.7 ms, p99 11.1 ms |
 | 4. Settle to IEND through the open handle | Hammerspoon | 0.17 ms per check |
 | 5. Verified PNG-only clipboard write | Hammerspoon | 0.4 ms read + 3–19 ms pasteboard |
-| 6. Thumbnail, then the Pop sound | Hammerspoon | ~30–90 ms to actually visible |
+| 6. Thumbnail (no sound: `hs.sound` blocks the main thread on coreaudiod) | Hammerspoon | ~30–90 ms to actually visible |
 | — | Apple's rename to the final name | **off the path**: p90 225 ms, p99 ~10 s |
 
 **Why `st_size` alone, and nothing else.** APFS reports a directory's size as 32 bytes per
@@ -257,7 +257,7 @@ naming its hidden-name lifecycle.
 - **Nothing synchronous on a timer callback.** No `hs.execute`, `os.execute`, `io.popen` or
   `hs.osascript` anywhere — `hs.execute` is `io.popen` + `read('*a')` + `close()`, a fork/exec/
   waitpid with no timeout at all, median 43 ms and worst case unbounded. `hs.task` only.
-- **The lazy modules are warmed at load.** `hs.mouse`, `hs.screen`, `hs.sound` and `hs.canvas`
+- **The lazy modules are warmed at load.** `hs.mouse`, `hs.screen` and `hs.canvas`
   are otherwise first touched inside the settle path, so the first screenshot after every launch
   paid 20–40 ms of module loading on the user's latency path.
 - **A stall is never made up.** A 351 ms block across a repeating timer produced seven missed

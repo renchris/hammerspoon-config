@@ -20,7 +20,6 @@ local M = {}
 local cfg = {
   maxW = 320, padding = 16, radius = 10, shadow = 12,
   dismiss = 3, fade = 0.3, entrance = 0.12,
-  sound = true,
 }
 
 -- Module-scope, not global.  A table reachable from package.loaded anchors a canvas or a timer
@@ -31,7 +30,6 @@ local dismissTimer = nil
 local visTimer     = nil
 local screens      = {}    -- cached {full=, frame=} — refreshed by hs.screen.watcher, never per shot
 local screenWatcher = nil
-local pop          = nil   -- hs.sound, loaded ONCE at start (7 ms inside the settle path otherwise)
 local resolver     = nil   -- function(ino) -> current path, injected by the orchestrator
 
 local function refreshScreens()
@@ -97,7 +95,7 @@ end
 function M.start(opts)
   opts = opts or {}
   for k, v in pairs(opts.config or {}) do cfg[k] = v end
-  -- Only when one is supplied: benchMode() re-enters start() to flip `sound`/`dismiss`, and
+  -- Only when one is supplied: benchMode() re-enters start() to flip `dismiss`, and
   -- clearing the resolver there would leave every later thumbnail clicking a stale path.
   if opts.resolve then resolver = opts.resolve end
   refreshScreens()
@@ -105,8 +103,6 @@ function M.start(opts)
     screenWatcher = hs.screen.watcher.new(refreshScreens)
     screenWatcher:start()
   end
-  -- Loaded once, here, rather than inside the settle path.
-  pop = hs.sound.getByName("Pop")
   return true
 end
 
@@ -115,7 +111,6 @@ function M.stop()
   if dismissTimer then dismissTimer:stop(); dismissTimer = nil end
   if current then pcall(function() current:delete() end); current = nil end
   if screenWatcher then screenWatcher:stop(); screenWatcher = nil end
-  pop = nil
 end
 
 --- Show the thumbnail for a shot.  `shot` carries { ino, id, path, file, createdNs }.
@@ -197,9 +192,12 @@ function M.show(shot, img)
   log.emit("thumb-shown", { id = shot.id, dt = clock.mono() - shot.createdNs,
                             x = x, y = y, w = cw, h = ch, file = shot.file })
 
-  -- Pop AFTER the canvas is up (hostile review item 10): the sound is the confirmation, and a
-  -- confirmation that precedes the thing it confirms is a lie the user can hear.
-  if cfg.sound and pop then pcall(function() pop:play() end) end
+  -- 🚨 NO SOUND, AND IT STAYS GONE.  The Pop that used to play here was hs.sound:play() — a
+  -- SYNCHRONOUS AudioQueue start on this main thread.  On 2026-10-09 coreaudiod stopped answering
+  -- (its client thread was parked in a TCC preflight) and that one call sat through eight 30 s HAL
+  -- timeouts: Hammerspoon frozen 264 s, 21:29:42 → 21:34:06, with the screenshot poll, the
+  -- smartpaste tap and every hotkey dead.  The thumbnail is the confirmation.  An afplay child is
+  -- not a substitute: a fresh audio client per shot is the shape that parked coreaudiod.
 
   -- `phase=thumb-visible` comes from isOccluded(), which is the ORACLE: it reports whether the
   -- window server is actually presenting this window. isShowing() is NOT one — it returns true for
@@ -229,7 +227,7 @@ function M.show(shot, img)
 end
 
 function M.stats()
-  return { visible = current ~= nil, screens = #screens, sound = cfg.sound and pop ~= nil,
+  return { visible = current ~= nil, screens = #screens, sound = false,
            dismiss = cfg.dismiss, entrance = cfg.entrance }
 end
 

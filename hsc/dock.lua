@@ -10,7 +10,8 @@
 -- the screenshot poll.  hs.plist.read is in-process: 1.88–2.02 ms, no fork, no timeout to miss.
 --
 -- Nothing on a timer callback in this config may call hs.execute, os.execute, io.popen or
--- hs.osascript.  hs.task (asynchronous) is the only sanctioned way to reach another process.
+-- hs.osascript — nor hs.sound, whose play() is a synchronous call into coreaudiod (264 s frozen on
+-- 2026-10-09).  hs.task (asynchronous) is the only sanctioned way to reach another process.
 local apps = require("hsc.apps")
 local log  = require("hsc.log")
 
