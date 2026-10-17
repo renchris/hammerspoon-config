@@ -27,9 +27,8 @@ local M = {}
 
 local cfg = {
   dir            = os.getenv("HOME") .. "/Screenshots",
-  pollS          = 0.005,   -- the TIMER interval; the directory is stat'd every other tick
-  settleEvery    = 1,       -- settle on every tick — see the comment on the timer below
-  dirEvery       = 2,       -- ...and stat the directory on every second one, i.e. the 10 ms poll
+  pollS          = 0.010,   -- the base timer: stat the directory every tick, i.e. the 10 ms poll
+  settleS        = 0.005,   -- the settle timer, alive only while a shot is pending — see below
   backstopS      = 1.0,     -- the net-zero-tick backstop; one listing/s, 2.4 ms, ~0.24 % of a core
   reconcileMax   = 10,      -- bound on the re-list loop after a size change
   creationWindow = 30,      -- a candidate must have been created within this many seconds
@@ -42,7 +41,7 @@ local cfg = {
 }
 
 local state = {
-  timer = nil, w = nil, started = false,
+  timer = nil, settleTimer = nil, w = nil, started = false,
   pending = {},          -- ino -> candidate
   copied  = {},          -- ino -> { path, file, t }  (dedup, recorded on VERIFIED copy only)
   counts  = { created = 0, copied = 0, lost = 0, gone = 0, renamed = 0, notpng = 0 },
@@ -184,6 +183,8 @@ local function onCandidate(c)
     size = 0, isPng = false, settlingLogged = false,
   }
   state.pending[ino] = rec
+  -- Something is pending, so the 5 ms settle timer runs until settleTick empties the table.
+  if state.settleTimer and not state.settleTimer:running() then state.settleTimer:start() end
   state.counts.created = state.counts.created + 1
   log.emit("created", { id = rec.id, size = c.attrs.size or 0, retro = c.retro, file = c.name })
 end
@@ -272,11 +273,15 @@ local function settleTick()
       end
     end
   end
-  if not done then return end
-  -- Ascending write sequence, so when two shots settle in the same tick the LATER capture is the
-  -- one left on the clipboard (F1 acceptance L3).
-  table.sort(done, function(a, b) return a.seq < b.seq end)
-  for _, rec in ipairs(done) do finish(rec) end
+  if done then
+    -- Ascending write sequence, so when two shots settle in the same tick the LATER capture is the
+    -- one left on the clipboard (F1 acceptance L3).
+    table.sort(done, function(a, b) return a.seq < b.seq end)
+    for _, rec in ipairs(done) do finish(rec) end
+  end
+  -- Every release happens above, so this is the one place the table can become empty: idle
+  -- again, back to the 10 ms base timer alone.
+  if next(state.pending) == nil and state.settleTimer then state.settleTimer:stop() end
 end
 
 local function pruneCopied()
@@ -364,33 +369,40 @@ function M.start(userCfg)
   warmModules()
   thumbnail.start({ resolve = M.resolve })
 
+  -- continueOnError = true.  hs.timer.new defaults to STOPPING the timer on the first Lua error in
+  -- its callback, which would turn a transient fault into a silent, permanent loss of detection —
+  -- the exact failure shape this rewrite exists to remove.
+  -- 🚨 TWO RATES, TWO TIMERS.  Detection wants a 10 ms directory stat — that is the interval C1
+  -- benchmarked (first-name detection p50 4.705 / p90 10.011 / p99 11.050 ms, 35/35 caught) and
+  -- the one the whole design is costed against.  The SETTLE wants to be faster than that, because
+  -- once a candidate is open the only question left is "has IEND landed yet", and every tick of
+  -- interval T adds T/2 on average and T at worst to the answer — measurably, on a path whose
+  -- total budget is 30 ms.  An lseek plus an 8-byte read is ~0.17 ms, so running it at 5 ms while
+  -- something is pending costs nothing and halves that term.  But a 5 ms timer that runs while
+  -- NOTHING is pending is 200 wakeups/s to answer a question nobody asked: the settle timer is
+  -- created stopped, started by onCandidate, and stopped by settleTick when the table empties
+  -- (DESIGN load-root-cause-2026-10-17 X22: 200 → 100 idle wakeups/s).  Created before the arm,
+  -- because the retro pass can put a shot in the table before the base timer exists.
+  state.settleTimer = hs.timer.new(cfg.settleS, function()
+    local ok, err = pcall(settleTick)
+    if not ok then log.error("settle", { msg = tostring(err) }) end
+  end, true)
+
   state.w = watcher.new({
     dir = cfg.dir, reconcileMax = cfg.reconcileMax, backstopS = cfg.backstopS,
     onCandidate = onCandidate,
   })
   state.w:arm(cfg.retroWindow, recentlyCopiedIds())
 
-  -- continueOnError = true.  hs.timer.new defaults to STOPPING the timer on the first Lua error in
-  -- its callback, which would turn a transient fault into a silent, permanent loss of detection —
-  -- the exact failure shape this rewrite exists to remove.
-  -- 🚨 TWO RATES, ONE TIMER.  Detection wants a 10 ms directory stat — that is the interval C1
-  -- benchmarked (first-name detection p50 4.705 / p90 10.011 / p99 11.050 ms, 35/35 caught) and
-  -- the one the whole design is costed against.  The SETTLE wants to be faster than that, because
-  -- once a candidate is open the only question left is "has IEND landed yet", and every tick of
-  -- interval T adds T/2 on average and T at worst to the answer — measurably, on a path whose
-  -- total budget is 30 ms.  An lseek plus an 8-byte read is ~0.17 ms, so running it at 5 ms while
-  -- something is pending costs nothing and halves that term.  One timer at 5 ms, the directory
-  -- stat every second tick, keeps the poll exactly as designed and does not double the listings.
-  local tickN = 0
+  -- The base timer: the 10 ms directory stat, continueOnError for the reason above.
   state.timer = hs.timer.new(cfg.pollS, function()
     local ok, err = pcall(function()
-      tickN = tickN + 1
-      -- Settle FIRST, discovery second.  On a directory tick the watcher may re-list (2.4 ms for
-      -- this directory, and up to the reconcile bound after a size change), and a candidate that
-      -- finished during the previous interval would otherwise wait behind that listing for no
-      -- reason: the bytes it needs are already on disk.  Ordering is free and the term is not.
-      settleTick()
-      if state.w and (tickN % cfg.dirEvery == 0) then state.w:tick() end
+      -- Settle FIRST, discovery second.  The watcher may re-list (2.4 ms for this directory, and
+      -- up to the reconcile bound after a size change), and a candidate that finished during the
+      -- previous interval would otherwise wait behind that listing for no reason: the bytes it
+      -- needs are already on disk.  Ordering is free and the term is not.
+      if next(state.pending) ~= nil then settleTick() end
+      if state.w then state.w:tick() end
     end)
     if not ok then log.error("tick", { msg = tostring(err) }) end
   end, true)
@@ -401,14 +413,15 @@ function M.start(userCfg)
 
   checkCaptureDefaults()
   state.started = true
-  log.emit("start", { module = "screenshot", poll_ms = cfg.pollS * 1000 * cfg.dirEvery,
-                      settle_ms = cfg.pollS * 1000,
+  log.emit("start", { module = "screenshot", poll_ms = cfg.pollS * 1000,
+                      settle_ms = cfg.settleS * 1000,
                       backstop_s = cfg.backstopS, cap_s = cfg.settleCapS, dir = cfg.dir })
   return true
 end
 
 function M.stop()
   if state.timer then state.timer:stop(); state.timer = nil end
+  if state.settleTimer then state.settleTimer:stop(); state.settleTimer = nil end
   if state.pruneTimer then state.pruneTimer:stop(); state.pruneTimer = nil end
   for _, rec in pairs(state.pending) do
     if rec.fh then pcall(function() rec.fh:close() end) end
@@ -446,7 +459,7 @@ function M.stats()
     watcher = state.w and state.w:stats() or nil,
     thumbnail = thumbnail.stats(),
     log = log.stats(),
-    config = { poll_ms = cfg.pollS * 1000 * cfg.dirEvery, settle_ms = cfg.pollS * 1000,
+    config = { poll_ms = cfg.pollS * 1000, settle_ms = cfg.settleS * 1000,
                backstop_s = cfg.backstopS, cap_s = cfg.settleCapS,
                creation_window_s = cfg.creationWindow, retro_s = cfg.retroWindow, tiff = cfg.tiff },
   }
