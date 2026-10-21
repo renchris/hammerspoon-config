@@ -221,6 +221,7 @@ local function finish(rec)
                        read_ns = tWrite - tRead, write_ns = tDone - tWrite,
                        pb_write_ns = info.w_ns, pb_verify_ns = info.v_ns, file = rec.file })
   clipboard.watchForClobber(info.cc, rec.id, rec.file, cfg.clobberAfterS)
+  pcall(function() require("hsc.smartpaste").warnIfBlind(rec.id) end)   -- secure input blinds ⌘V
 
   -- Only now does anything decode the image — and it decodes the bytes we just PROVED are on the
   -- pasteboard, not a path.  A capture is renamed twice while we hold it, so at this instant the

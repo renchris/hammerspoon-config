@@ -36,6 +36,28 @@ silence" below. Detection is now a directory poll, so what remains is mundane:
 3. Check the console for a Lua error: Hammerspoon > Console. A module that failed to load left
    a `phase=error` line naming itself.
 
+## ⌘V pastes nothing into Claude Code, but the log says `copied`
+
+**Symptom**: the thumbnail appears and the log has a verified `copied` line, but ⌘V in kitty
+does nothing. ⌃V typed by hand works. Alt+1-9 Dock shortcuts are dead too.
+
+**Cause**: Secure Event Input. While any app holds it (a focused password field), macOS delivers
+no keystroke to any event tap, so smartpaste never sees ⌘V; kitty gets it untouched and pastes the
+clipboard's text, which a screenshot does not have. The tap still reports itself enabled, so
+every health check reads green. Measured 2026-10-21: the SevenRooms OS iPad app held secure input
+from launch for 3 hours.
+
+Since 2026-10-21 the pipeline reports it: a `phase=warn ... holder=<app> pid=<pid>` line after
+`copied`, and an on-screen alert naming the app.
+
+**Fix**: press ⌃V instead, or release secure input by leaving the password field or quitting
+the holder. To check it by hand:
+
+```bash
+hs -c 'return tostring(hs.eventtap.isSecureInputEnabled())'               # true = taps are blind
+ioreg -n Root -d 1 -w 0 | grep -o '"kCGSSessionSecureInputPID"=[0-9]*'   # the holder's pid
+```
+
 ## Screenshots dropped in silence (FSEvents stalled) — fixed 2026-09-08
 
 **Symptom**: some screenshots copy, some don't, with no pattern, and the ones that don't

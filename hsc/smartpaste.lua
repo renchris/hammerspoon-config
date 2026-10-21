@@ -53,8 +53,47 @@ function M.stop()
   if tap then tap:stop(); tap = nil; log.emit("stop", { module = "smartpaste" }) end
 end
 
+-- 🚨 SECURE EVENT INPUT BLINDS THIS TAP, and nothing about the tap shows it.  While any app holds
+-- Secure Event Input (a focused password field), macOS delivers no keystroke to ANY event tap, so
+-- ⌘V reaches kitty untouched, kitty pastes the clipboard's text (there is none) and the screenshot
+-- silently goes nowhere — while the tap still reports itself enabled.  Measured 2026-10-21: the
+-- SevenRooms OS iPad app held it from launch for 3 h; every pipeline log line read healthy.  ⌃V
+-- typed by hand still works — that is Claude Code's own binding, no tap involved.  So the screenshot
+-- module calls this after each verified copy, and the condition announces itself instead of costing
+-- an investigation.  The holder's pid comes from IOConsoleUsers via an ASYNC hs.task (ioreg, ~26 ms),
+-- spawned only when the in-process check already says secure input is on.
+--
+-- 🚨 THE grep RUNS INSIDE THE TASK, not in Lua.  `ioreg -n Root -d 1` prints ~87 KB, and an hs.task
+-- with no streaming callback does not drain stdout until exit: past the 64 KB pipe buffer ioreg
+-- blocks on write and the callback never fires (measured: two ioreg processes parked in state S).
+-- Filtered, the output is one ~40-byte line.  `probe` holds the task so a stuck one is never
+-- duplicated, and the 2 s timer kills it so a hang cannot silence every later warning.
+local probe = nil
+
+function M.warnIfBlind(id)
+  if not tap or not hs.eventtap.isSecureInputEnabled() then return false end
+  if probe then return true end
+  probe = hs.task.new("/bin/sh", function(_, out)
+    probe = nil
+    local pid = tonumber((out or ""):match('"kCGSSessionSecureInputPID"=(%d+)'))
+    local app = pid and hs.application.applicationForPID(pid)
+    local name = app and app:name() or "another app"
+    log.warn("secure-input", { id = id, msg = "secure input on; ⌘V rewrite is blind", pid = pid or 0,
+                               holder = name })
+    hs.alert.show(string.format("⌘V can't paste this screenshot: %s holds Secure Input.\n"
+                                .. "Press ⌃V in Claude Code, or quit %s.", name, name), 4)
+  end, { "-c", [[/usr/sbin/ioreg -n Root -d 1 -w 0 | /usr/bin/grep -o '"kCGSSessionSecureInputPID"=[0-9]*']] })
+  probe:start()
+  local mine = probe
+  hs.timer.doAfter(2, function()
+    if probe == mine then probe:terminate(); probe = nil end
+  end)
+  return true
+end
+
 function M.stats()
-  return { running = tap ~= nil and tap:isEnabled() or false }
+  return { running = tap ~= nil and tap:isEnabled() or false,
+           secure_input = hs.eventtap.isSecureInputEnabled() }
 end
 
 return M
