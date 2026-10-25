@@ -6,10 +6,19 @@ module under `hsc/`:
 1. **Screenshot to clipboard** (`hsc/screenshot/`) — Cmd+Shift+3/4 saves a file, copies it to
    the clipboard and shows a floating thumbnail, from the PNG's *hidden temporary name* so
    Apple's Spotlight stall is never on the path
-2. **Smart paste** (`hsc/smartpaste.lua`) — Cmd+V in terminal apps sends Ctrl+V when the
+2. **Break-glass** (`hsc/breakglass.lua`) — Ctrl+Alt+Cmd+Shift+B opens a rescue chooser
+   (Capture, Unpoison, Brownout hold, Rescue terminal, Kernel stacks, Restart guidance, Kill
+   kitty, Self-test); Ctrl+Alt+Cmd+Shift+C captures with no UI. For when no terminal can start
+   a shell: Hammerspoon has no controlling tty, so its `hs.task` children never reach
+   `ttyname()` (claude-infrastructure incident 2026-10-25; the kit is
+   `~/.claude/scripts/break-glass/rescue.sh`, installed by that repo's migration 0081)
+3. **Smart paste** (`hsc/smartpaste.lua`) — Cmd+V in terminal apps sends Ctrl+V when the
    clipboard has an image (for Claude Code image paste)
-3. **Dock app shortcuts** (`hsc/dock.lua`) — Alt+1-9,0 launches/focuses pinned Dock apps
+4. **Dock app shortcuts** (`hsc/dock.lua`) — Alt+1-9,0 launches/focuses pinned Dock apps
    (auto-updates when the Dock changes, disables in terminals for tmux Alt+N)
+5. **Lockwatch menubar** (`hsc/lockwatch.lua`) — reads lockprobe's `state.json` and `hb` every
+   15 s (OK / WATCH / DIAG / ESC / STALE, plus the QoS band), and sends one Pushover page if
+   `hb` goes stale past 120 s outside a 2-minute post-wake grace
 
 Modules load and start in that order, each under its own `pcall`, so a module that fails
 costs only itself. Shutdown runs the list in reverse from `hs.shutdownCallback`.

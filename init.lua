@@ -38,8 +38,10 @@ log.emit("start", { module = "init", root = ROOT, hs = hs.processInfo.version })
 -- The registry.  Order is load order AND start order; shutdown runs it in reverse.
 local REGISTRY = {
   { name = "screenshot", path = "hsc.screenshot" },
+  { name = "breakglass", path = "hsc.breakglass" },   -- no-tty rescue chooser (⌃⌥⌘⇧B / ⌃⌥⌘⇧C), 2026-10-25
   { name = "smartpaste", path = "hsc.smartpaste" },
   { name = "dock",       path = "hsc.dock" },
+  { name = "lockwatch",  path = "hsc.lockwatch" },    -- lockwatch menubar + hb dead-man page
 }
 
 local loaded = {}
